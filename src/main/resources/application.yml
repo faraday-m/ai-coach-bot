@@ -1,0 +1,165 @@
+server:
+  port: ${BOT_WEB_PORT:8080}
+
+spring:
+  application:
+    name: coach-bot
+  datasource:
+    url: "jdbc:sqlite:${DATA_DIR:data}/bot.db"
+    driver-class-name: org.sqlite.JDBC
+    hikari:
+      maximum-pool-size: 1        # SQLite: single writer
+      connection-timeout: 30000
+  sql:
+    init:
+      mode: always               # schema.sql runs on every start (idempotent IF NOT EXISTS)
+  threads:
+    virtual:
+      enabled: true              # Java 21 virtual threads for @Async / TaskExecutor
+
+bot:
+  name: "Andy"
+  timezone: "${BOT_TIMEZONE:UTC}"
+  # Language for the onboarding wizard questions.
+  # Set to an ISO 639-1 code (e.g. "ru", "de", "es") to translate questions automatically.
+  # Default "en" means no translation (questions shown in English as-is).
+  language: "${BOT_LANGUAGE:en}"
+  # SimplyTranslate AI — used to translate onboarding questions when bot.language != en.
+  translate:
+    url: "${BOT_TRANSLATE_URL:https://api.mymemory.translated.net}"
+    api-key: "${BOT_TRANSLATE_API_KEY:}"   # optional: your e-mail for 10k chars/day (default: 5k anonymous)
+
+  # ── Credential providers ──────────────────────────────────────────────────
+  # Controls how LLM backends obtain their API keys.
+  # Backends resolve credentials in this order:
+  #   1. Inline value in bot.llm.X.api-key (direct, env-var interpolation)
+  #   2. Credential provider specified in bot.llm.X.credential-provider
+  #   3. Transparent proxy: set bot.llm.X.base-url → no key needed in JVM
+  credentials:
+    vault:
+      enabled: false
+      url: "${VAULT_ADDR:http://localhost:8200}"
+      token: "${VAULT_TOKEN:}"
+      secret-path: "secret/data/coach-bot"
+    onecli:
+      enabled: false
+      url: "${ONECLI_URL:http://localhost:10254}"
+
+  transports:
+    console:
+      enabled: true
+    telegram:
+      enabled: false
+      token: "${TELEGRAM_BOT_TOKEN:}"
+    jabber:
+      enabled: false
+      # XMPP domain (e.g. jabber.org, your own server)
+      server:   "${BOT_JABBER_SERVER:}"
+      # Optional: direct host/IP when DNS doesn't resolve the XMPP SRV record
+      host:     "${BOT_JABBER_HOST:}"
+      port:     "${BOT_JABBER_PORT:5222}"
+      username: "${BOT_JABBER_USERNAME:}"
+      password: "${BOT_JABBER_PASSWORD:}"
+      # Set true only for local/self-signed setups — disables TLS validation
+      accept-all-certs: "${BOT_JABBER_ACCEPT_ALL_CERTS:false}"
+
+  # ── LLM backends ─────────────────────────────────────────────────────────
+  # All backends are OFF by default. Enable exactly one (or more) via env var:
+  #   BOT_LLM_CLAUDE_ENABLED=true   ANTHROPIC_API_KEY=sk-ant-...
+  #   BOT_LLM_GEMINI_ENABLED=true   GEMINI_API_KEY=AIza...
+  #   BOT_LLM_OPENAI_ENABLED=true   OPENAI_API_KEY=sk-...
+  #   BOT_LLM_OLLAMA_ENABLED=true   (no key needed)
+  llm:
+    claude:
+      enabled: false
+
+      # ── Mode 1: Direct API key (default) ──────────────────────────────────
+      api-key: "${ANTHROPIC_API_KEY:}"
+      # api-key-name: ANTHROPIC_API_KEY   # name in the credential store (if using provider)
+      # credential-provider: env           # env | vault | onecli (default: env)
+
+      # ── Mode 2: Transparent proxy (OneCLI / LiteLLM / any MITM proxy) ────
+      # Set base-url to route ALL Claude calls through the proxy.
+      # The proxy injects the real API key — this JVM never sees it.
+      # base-url: "${ONECLI_URL:}/anthropic"   # e.g. http://localhost:10254/anthropic
+
+      model: "claude-opus-4-5"
+      max-tokens: 4096
+
+    ollama:
+      enabled: false
+      # Ollama has no API key by design — base-url is the only config needed.
+      # Can also point at a proxy that adds auth (e.g. hosted Ollama with nginx basic auth).
+      base-url: "${OLLAMA_URL:http://localhost:11434}"
+      model: "gemma3:12b"
+
+    openai:
+      enabled: false
+
+      # ── Mode 1: OpenAI directly ───────────────────────────────────────────
+      api-key: "${OPENAI_API_KEY:}"
+      # api-key-name: OPENAI_API_KEY       # name in the credential store
+      # credential-provider: env            # env | vault | onecli (default: env)
+
+      # ── Mode 2: OpenAI-compatible endpoint (Groq, Together AI, LM Studio…) ─
+      # Set base-url to point at any OpenAI-compatible API.
+      # api-key is still used if the endpoint requires one (e.g. Groq).
+      # For keyless local endpoints (LM Studio) the key is ignored.
+      # base-url: "https://api.groq.com/openai/v1"   # Groq (fast Llama/Mixtral)
+      # base-url: "http://localhost:1234/v1"           # LM Studio (local, no key)
+      # base-url: "${ONECLI_URL:}/openai"              # OneCLI proxy mode
+
+      model: "gpt-4o"
+      max-tokens: 4096
+
+    gemini:
+      enabled: false
+
+      # Get a free key at https://aistudio.google.com/app/apikey
+      api-key: "${GEMINI_API_KEY:}"
+      # api-key-name: GEMINI_API_KEY       # name in the credential store
+      # credential-provider: env            # env | vault | onecli (default: env)
+
+      # Recommended models:
+      #   gemini-2.0-flash          — fast + cheap (default)
+      #   gemini-1.5-pro            — long context (up to 2M tokens)
+      #   gemini-2.5-pro-preview-05-06 — best reasoning
+      model: "gemini-2.0-flash"
+      max-output-tokens: 4096
+
+  # ── Web admin UI ─────────────────────────────────────────────────────────────
+  # Accessible at http://localhost:8080 (or BOT_WEB_PORT)
+  # Protect with a strong password in production!
+  web:
+    username: "${BOT_WEB_USERNAME:admin}"
+    password: "${BOT_WEB_PASSWORD:coach-bot}"
+
+  storage:
+    filesystem:
+      enabled: true
+      base-path: "${NOTES_DIR:notes}"
+    obsidian:
+      enabled: false
+      # Inside the Docker container the vault is always mounted at /obsidian.
+      # OBSIDIAN_VAULT_PATH is the *host* path used only by docker-compose for the bind mount.
+      # Override OBSIDIAN_NOTES_DIR only when running outside Docker.
+      vault-path: "${OBSIDIAN_NOTES_DIR:/obsidian}"
+
+# Initial agent seed — written to SQLite on first run; after that SQLite is source of truth
+seeds:
+  agents:
+    - id: default
+      name: "${BOT_AGENT_NAME:My Coach}"
+      system-prompt: ""   # empty on first run — use /onboard or the Admin UI to set a prompt
+      llm-backend: "${BOT_DEFAULT_LLM_BACKEND:claude}"   # override: BOT_DEFAULT_LLM_BACKEND=gemini
+      storage-backend: filesystem
+      trigger: "@Andy"
+      require-trigger: false          # console = single user, no trigger needed
+      transports:
+        - transport-id: console
+          chat-id: console
+
+logging:
+  level:
+    dev.coachbot: INFO
+    dev.langchain4j: WARN

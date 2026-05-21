@@ -1,0 +1,47 @@
+services:
+
+  # ── Main bot ────────────────────────────────────────────────────────────────
+  coach-bot:
+    build: .
+    env_file:
+      - path: .env
+        required: false          # .env is optional — you can also use environment: below
+    volumes:
+      - ./data:/data                                    # SQLite bot.db (persistent)
+      - ${OBSIDIAN_VAULT_PATH:-./obsidian}:/obsidian    # Obsidian vault (mount yours here)
+      - ./notes:/notes                                  # Plain Markdown notes
+      - ./config:/config                                # application.yml override
+    ports:
+      - "${BOT_WEB_PORT:-8080}:8080"      # Admin UI — http://localhost:8080
+    environment:
+      # Uncomment / override specific vars here if you prefer not to use .env
+      # - BOT_LLM_OLLAMA_ENABLED=true
+      # - BOT_LLM_OLLAMA_BASE_URL=http://host.docker.internal:11434
+      # - BOT_LLM_OLLAMA_MODEL=gemma4:e4b
+      # - BOT_DEFAULT_LLM_BACKEND=ollama
+      - ANTHROPIC_API_KEY
+      - TELEGRAM_BOT_TOKEN
+      - BOT_WEB_USERNAME    # admin by default
+      - BOT_WEB_PASSWORD    # coach-bot by default — change in production!
+    # host.docker.internal resolves to the Docker host automatically on macOS/Windows.
+    # On Linux it is not injected by default — this line adds it:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    stdin_open: false   # set to true to enable console transport inside Docker
+
+  # ── Bundled Ollama — only if you DON'T have Ollama installed on the host ────
+  # If Ollama is already running on your machine, skip this profile entirely
+  # and point BOT_LLM_OLLAMA_BASE_URL at http://host.docker.internal:11434
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   profiles: [local-llm]
+  #   volumes:
+  #     - ollama-models:/root/.ollama
+  #   ports:
+  #     - "11434:11434"
+    # After first start, pull your model:
+    #   docker compose exec ollama ollama pull gemma4:e4b
+
+volumes:
+  ollama-models:

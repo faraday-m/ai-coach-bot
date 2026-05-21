@@ -1,0 +1,24 @@
+### Maven
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+### Runtime data (don't commit)
+data/**
+notes/**
+config/**
+!config/*.example          # track example files, not real configs with secrets
+
+### IDE
+.idea/**
+*.iml
+.vscode/**
+*.class
+
+### Secrets
+.env
+.env.bak
+*.env
+
+### OS
+.DS_Store
+Thumbs.db
