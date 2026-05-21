@@ -5,8 +5,9 @@ target/
 ### Runtime data (don't commit)
 data/**
 notes/**
-config/**
-!config/*.example          # track example files, not real configs with secrets
+# track example files, not real configs with secrets
+config/*
+!config/*.example
 
 ### IDE
 .idea/**

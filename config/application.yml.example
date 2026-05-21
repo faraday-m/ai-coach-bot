@@ -1,0 +1,77 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# coach-bot external config — copy to application.yml and fill in your values
+#
+# This file OVERRIDES the built-in defaults (classpath:application.yml).
+# You only need to specify what you want to change — everything else falls back
+# to the bundled defaults.
+#
+# HOW TO USE
+# ──────────
+# Docker:      put this file at ./config/application.yml (mounted to /config/)
+# Bare jar:    put application.yml next to the jar, or in ./config/application.yml
+# Env vars:    any property → uppercase + underscores, e.g.
+#                bot.llm.claude.api-key  →  BOT_LLM_CLAUDE_API_KEY=sk-ant-...
+# ──────────────────────────────────────────────────────────────────────────────
+
+bot:
+
+  # ── LLM backend ─────────────────────────────────────────────────────────────
+  llm:
+
+    # Pick ONE of the blocks below (or enable multiple and point agents at them).
+
+    # Option A — Anthropic Claude (official API key)
+    claude:
+      enabled: true
+      api-key: "${ANTHROPIC_API_KEY}"        # sk-ant-api03-...
+      model: "claude-opus-4-5"               # or claude-sonnet-4-5, claude-haiku-3-5
+
+    # Option B — Google Gemini (free key from aistudio.google.com)
+    # gemini:
+    #   enabled: true
+    #   api-key: "${GEMINI_API_KEY}"
+    #   model: "gemini-2.0-flash"
+
+    # Option C — OpenAI or compatible (Groq, LM Studio, Together AI …)
+    # openai:
+    #   enabled: true
+    #   api-key: "${OPENAI_API_KEY}"
+    #   model: "gpt-4o"
+    #   # base-url: "https://api.groq.com/openai/v1"   # ← Groq example
+
+    # Option D — Local Ollama (no key needed)
+    # ollama:
+    #   enabled: true
+    #   base-url: "http://localhost:11434"     # or http://ollama:11434 inside Docker
+    #   model: "gemma3:12b"
+
+  # ── Transports ──────────────────────────────────────────────────────────────
+  transports:
+    console:
+      enabled: false                         # disable for headless/daemon mode
+    telegram:
+      enabled: true
+      token: "${TELEGRAM_BOT_TOKEN}"
+
+  # ── Storage ──────────────────────────────────────────────────────────────────
+  storage:
+    filesystem:
+      enabled: true
+      base-path: "${NOTES_DIR:/notes}"
+    # obsidian:
+    #   enabled: true
+    #   vault-path: "${OBSIDIAN_VAULT_PATH:/obsidian}"
+
+# ── Agents (seed — only applied on first run if the DB is empty) ──────────────
+seeds:
+  agents:
+    - id: default
+      name: "Java Coach"
+      system-prompt-classpath: "prompts/java-coach.md"
+      llm-backend: claude                    # must match an enabled backend above
+      storage-backend: filesystem
+      trigger: "@Andy"
+      require-trigger: false
+      transports:
+        - transport-id: telegram
+          chat-id: "${TELEGRAM_CHAT_ID}"     # e.g. -1001234567890 for a group
