@@ -21,41 +21,43 @@ public class ScheduleRepository {
     /** Returns all enabled schedules. Called once at startup to register cron tasks. */
     public List<AgentSchedule> findAllEnabled() {
         return jdbc.query(
-                "SELECT id, agent_id, cron, prompt FROM agent_schedules WHERE enabled = 1",
+                "SELECT id, agent_id, cron, prompt, save_path FROM agent_schedules WHERE enabled = 1",
                 (rs, __) -> new AgentSchedule(
                         rs.getLong("id"),
                         rs.getString("agent_id"),
                         rs.getString("cron"),
                         rs.getString("prompt"),
-                        true
+                        true,
+                        rs.getString("save_path")
                 ));
     }
 
     /** Returns all schedules for a specific agent (including disabled ones). */
     public List<AgentSchedule> findByAgent(String agentId) {
         return jdbc.query(
-                "SELECT id, agent_id, cron, prompt, enabled FROM agent_schedules WHERE agent_id = ?",
+                "SELECT id, agent_id, cron, prompt, enabled, save_path FROM agent_schedules WHERE agent_id = ?",
                 (rs, __) -> new AgentSchedule(
                         rs.getLong("id"),
                         rs.getString("agent_id"),
                         rs.getString("cron"),
                         rs.getString("prompt"),
-                        rs.getInt("enabled") == 1
+                        rs.getInt("enabled") == 1,
+                        rs.getString("save_path")
                 ),
                 agentId);
     }
 
     /** Inserts a new schedule. Returns the generated ID. */
-    public long insert(String agentId, String cron, String prompt) {
+    public long insert(String agentId, String cron, String prompt, String savePath) {
         jdbc.update(
-                "INSERT INTO agent_schedules (agent_id, cron, prompt, enabled, created_at) VALUES (?,?,?,1,?)",
-                agentId, cron, prompt, Instant.now().toString());
+                "INSERT INTO agent_schedules (agent_id, cron, prompt, save_path, enabled, created_at) VALUES (?,?,?,?,1,?)",
+                agentId, cron, prompt, nullIfBlank(savePath), Instant.now().toString());
         return jdbc.queryForObject("SELECT last_insert_rowid()", Long.class);
     }
 
-    public void update(long id, String cron, String prompt) {
-        jdbc.update("UPDATE agent_schedules SET cron = ?, prompt = ? WHERE id = ?",
-                cron, prompt, id);
+    public void update(long id, String cron, String prompt, String savePath) {
+        jdbc.update("UPDATE agent_schedules SET cron = ?, prompt = ?, save_path = ? WHERE id = ?",
+                cron, prompt, nullIfBlank(savePath), id);
     }
 
     public void setEnabled(long id, boolean enabled) {
@@ -66,7 +68,18 @@ public class ScheduleRepository {
         jdbc.update("DELETE FROM agent_schedules WHERE id = ?", id);
     }
 
+    // ── Helpers ────────────────────────────────────────────────────────────────
+
+    private static String nullIfBlank(String s) {
+        return (s == null || s.isBlank()) ? null : s.trim();
+    }
+
     // ── Record ─────────────────────────────────────────────────────────────────
 
-    public record AgentSchedule(long id, String agentId, String cron, String prompt, boolean enabled) {}
+    /**
+     * @param savePath optional storage path; supports {@code {date}} placeholder.
+     *                 {@code null} means "don't save to storage".
+     */
+    public record AgentSchedule(long id, String agentId, String cron, String prompt, boolean enabled,
+                                String savePath) {}
 }

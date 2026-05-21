@@ -388,6 +388,7 @@ public class AgentDetailView extends VerticalLayout implements BeforeEnterObserv
         var grid = new Grid<AgentSchedule>(AgentSchedule.class, false);
         grid.addColumn(AgentSchedule::cron).setHeader("Cron").setAutoWidth(true);
         grid.addColumn(AgentSchedule::prompt).setHeader("Prompt").setFlexGrow(1);
+        grid.addColumn(s -> s.savePath() != null ? s.savePath() : "—").setHeader("Save to").setAutoWidth(true);
         grid.addComponentColumn(s -> {
             var edit = new Button("Edit");
             edit.addThemeVariants(ButtonVariant.LUMO_TERTIARY, ButtonVariant.LUMO_SMALL);
@@ -400,7 +401,7 @@ public class AgentDetailView extends VerticalLayout implements BeforeEnterObserv
             toggle.addClickListener(e -> {
                 boolean enable = !s.enabled();
                 scheduleRepo.setEnabled(s.id(), enable);
-                if (enable) agentScheduler.register(new AgentSchedule(s.id(), s.agentId(), s.cron(), s.prompt(), true));
+                if (enable) agentScheduler.register(new AgentSchedule(s.id(), s.agentId(), s.cron(), s.prompt(), true, s.savePath()));
                 else        agentScheduler.cancel(s.id());
                 grid.setItems(scheduleRepo.findByAgent(agent.id()));
             });
@@ -430,24 +431,31 @@ public class AgentDetailView extends VerticalLayout implements BeforeEnterObserv
         promptField.setMinHeight("60px");
         promptField.setWidthFull();
 
+        var savePathField = new TextField();
+        savePathField.setPlaceholder("journal/{date}  (optional)");
+        savePathField.setWidth("200px");
+        savePathField.setHelperText("Storage path; {date} = today");
+
         var addBtn = new Button("Add Schedule");
         addBtn.addThemeVariants(ButtonVariant.LUMO_PRIMARY, ButtonVariant.LUMO_SMALL);
         addBtn.addClickListener(e -> {
-            String cron   = cronField.getValue().trim();
-            String prompt = promptField.getValue().trim();
+            String cron     = cronField.getValue().trim();
+            String prompt   = promptField.getValue().trim();
+            String savePath = savePathField.getValue().trim();
             if (cron.isEmpty() || prompt.isEmpty()) {
                 notify("Both cron and prompt are required.", true);
                 return;
             }
-            long id = scheduleRepo.insert(agent.id(), cron, prompt);
-            agentScheduler.register(new AgentSchedule(id, agent.id(), cron, prompt, true));
+            long id = scheduleRepo.insert(agent.id(), cron, prompt, savePath);
+            agentScheduler.register(new AgentSchedule(id, agent.id(), cron, prompt, true, savePath.isEmpty() ? null : savePath));
             grid.setItems(scheduleRepo.findByAgent(agent.id()));
             cronField.clear();
             promptField.clear();
+            savePathField.clear();
             notify("Schedule added and activated.", false);
         });
 
-        var addRow = new HorizontalLayout(cronField, promptField, addBtn);
+        var addRow = new HorizontalLayout(cronField, promptField, savePathField, addBtn);
         addRow.setDefaultVerticalComponentAlignment(FlexComponent.Alignment.END);
         addRow.setWidthFull();
         addRow.expand(promptField);
@@ -474,19 +482,27 @@ public class AgentDetailView extends VerticalLayout implements BeforeEnterObserv
         promptField.setMinHeight("100px");
         promptField.setWidthFull();
 
-        var content = new VerticalLayout(cronField, promptField);
+        var savePathField = new TextField("Save to (optional)");
+        savePathField.setValue(schedule.savePath() != null ? schedule.savePath() : "");
+        savePathField.setPlaceholder("journal/{date}");
+        savePathField.setHelperText("Storage path; supports {date} placeholder. Leave empty to not save.");
+        savePathField.setWidthFull();
+
+        var content = new VerticalLayout(cronField, promptField, savePathField);
         content.setPadding(false);
         dialog.add(content);
 
         var cancel = new Button("Cancel", e -> dialog.close());
         var save = new Button("Save", e -> {
-            String cron   = cronField.getValue().trim();
-            String prompt = promptField.getValue().trim();
-            if (cron.isEmpty() || prompt.isEmpty()) { notify("Both fields are required.", true); return; }
-            scheduleRepo.update(schedule.id(), cron, prompt);
+            String cron     = cronField.getValue().trim();
+            String prompt   = promptField.getValue().trim();
+            String savePath = savePathField.getValue().trim();
+            if (cron.isEmpty() || prompt.isEmpty()) { notify("Both cron and prompt are required.", true); return; }
+            scheduleRepo.update(schedule.id(), cron, prompt, savePath);
             agentScheduler.cancel(schedule.id());
             if (schedule.enabled()) {
-                agentScheduler.register(new AgentSchedule(schedule.id(), schedule.agentId(), cron, prompt, true));
+                agentScheduler.register(new AgentSchedule(schedule.id(), schedule.agentId(), cron, prompt, true,
+                        savePath.isEmpty() ? null : savePath));
             }
             grid.setItems(scheduleRepo.findByAgent(agent.id()));
             dialog.close();

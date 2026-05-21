@@ -401,7 +401,7 @@ public class ManageCli {
         String cron    = p.get(1);
         String prompt  = String.join(" ", p.subList(2, p.size()));
         findOrFail(agentId);
-        long id = scheduleRepo.insert(agentId, cron, prompt);
+        long id = scheduleRepo.insert(agentId, cron, prompt, null);
         println("✓ Schedule #" + id + " created: " + cron + " → " + truncate(prompt, 60));
         println("  Restart the bot to activate the new schedule.");
     }

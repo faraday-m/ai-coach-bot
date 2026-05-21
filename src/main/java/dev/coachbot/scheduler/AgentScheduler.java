@@ -5,6 +5,8 @@ import dev.coachbot.core.AgentRepository;
 import dev.coachbot.llm.LlmBackend;
 import dev.coachbot.llm.LlmBackendRegistry;
 import dev.coachbot.llm.LlmRequest;
+import dev.coachbot.storage.StorageBackend;
+import dev.coachbot.storage.StorageBackendRegistry;
 import dev.coachbot.transport.TransportPlugin;
 import dev.coachbot.transport.TransportRegistry;
 import jakarta.annotation.PostConstruct;
@@ -15,8 +17,10 @@ import org.springframework.scheduling.support.CronExpression;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
+import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
@@ -44,6 +48,7 @@ public class AgentScheduler {
     private final AgentRepository agentRepo;
     private final LlmBackendRegistry llmRegistry;
     private final TransportRegistry transportRegistry;
+    private final StorageBackendRegistry storageRegistry;
     private final ZoneId timezone;
 
     private final ScheduledExecutorService executor =
@@ -56,11 +61,13 @@ public class AgentScheduler {
                           AgentRepository agentRepo,
                           LlmBackendRegistry llmRegistry,
                           TransportRegistry transportRegistry,
+                          StorageBackendRegistry storageRegistry,
                           @org.springframework.beans.factory.annotation.Value("${bot.timezone:UTC}") String timezone) {
         this.scheduleRepo      = scheduleRepo;
         this.agentRepo         = agentRepo;
         this.llmRegistry       = llmRegistry;
         this.transportRegistry = transportRegistry;
+        this.storageRegistry   = storageRegistry;
         this.timezone          = ZoneId.of(timezone);
     }
 
@@ -202,6 +209,37 @@ public class AgentScheduler {
                         schedule.id(), binding.transportId(), binding.chatId(), e);
             }
         }
+
+        // ── Save to storage if save_path is configured ─────────────────────
+        if (schedule.savePath() != null && !schedule.savePath().isBlank()) {
+            saveToStorage(schedule, agent, response);
+        }
+    }
+
+    private void saveToStorage(ScheduleRepository.AgentSchedule schedule, AgentConfig agent, String response) {
+        Optional<StorageBackend> storageOpt = storageRegistry.find(agent.storageBackendId());
+        if (storageOpt.isEmpty()) {
+            log.warn("Schedule #{}: storage backend '{}' not available — skipping save.",
+                    schedule.id(), agent.storageBackendId());
+            return;
+        }
+        String path = resolveSavePath(schedule.savePath());
+        // Add .md extension if no extension present
+        if (!path.contains(".")) path = path + ".md";
+        try {
+            String timestamp = ZonedDateTime.now(timezone)
+                    .format(DateTimeFormatter.ofPattern("HH:mm"));
+            storageOpt.get().append(path, "\n## " + timestamp + "\n\n" + response + "\n");
+            log.info("Schedule #{}: response appended to '{}'", schedule.id(), path);
+        } catch (Exception e) {
+            log.warn("Schedule #{}: failed to save response to '{}'", schedule.id(), path, e);
+        }
+    }
+
+    /** Replaces {@code {date}} with today's date in YYYY-MM-DD format. */
+    private String resolveSavePath(String template) {
+        String date = LocalDate.now(timezone).format(DateTimeFormatter.ISO_LOCAL_DATE);
+        return template.replace("{date}", date);
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────

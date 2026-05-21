@@ -71,7 +71,11 @@ CREATE TABLE IF NOT EXISTS agent_schedules (
     agent_id    TEXT    NOT NULL,
     cron        TEXT    NOT NULL,   -- standard 5-part cron: "0 9 * * MON-FRI"
     prompt      TEXT    NOT NULL,   -- text sent to the LLM when this schedule fires
+    save_path   TEXT,               -- optional: also save LLM response to storage at this path
+                                    --   supports {date} placeholder → replaced with YYYY-MM-DD
     enabled     INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT,
     FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
 );
+-- Migration: add save_path to databases created before this column existed
+ALTER TABLE agent_schedules ADD COLUMN IF NOT EXISTS save_path TEXT;

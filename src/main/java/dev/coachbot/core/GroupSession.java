@@ -7,6 +7,7 @@ import dev.coachbot.llm.LlmRequest;
 import dev.coachbot.llm.LlmResponse;
 import dev.coachbot.onboarding.OnboardingFlow;
 import dev.coachbot.storage.StorageBackend;
+import dev.coachbot.storage.StorageException;
 import dev.coachbot.translation.TranslationService;
 import dev.coachbot.transport.InboundMessage;
 import dev.coachbot.transport.TransportRegistry;
@@ -20,6 +21,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -46,7 +49,8 @@ public class GroupSession {
 
     private static final Logger log = LoggerFactory.getLogger(GroupSession.class);
     private static final int MAX_HISTORY_TURNS = 20; // = 40 messages (user + assistant)
-    private static final String META_PROMPT_PATH = "prompts/meta/generate-coach-prompt.md";
+    private static final String META_PROMPT_PATH      = "prompts/meta/generate-coach-prompt.md";
+    private static final String WIKI_PROMPT_PATH      = "prompts/meta/wiki-summary.md";
 
     private volatile AgentConfig agentConfig;
     private final LlmBackend llmBackend;
@@ -59,6 +63,8 @@ public class GroupSession {
     private final CommandRepository commandRepository;
     /** Lazily loaded meta-prompt template for onboarding. */
     private volatile String metaPromptTemplate;
+    /** Lazily loaded meta-prompt template for /wiki summarisation. */
+    private volatile String wikiPromptTemplate;
     /** Commands for this agent, loaded once at session start. */
     private volatile List<AgentCommand> commands = List.of();
 
@@ -188,6 +194,12 @@ public class GroupSession {
             return;
         }
 
+        // ── /wiki — save to storage ───────────────────────────────────────────
+        if (text.startsWith("/wiki")) {
+            handleWiki(msg, canonicalId, text.substring(5).trim());
+            return;
+        }
+
         // ── Normal LLM conversation ───────────────────────────────────────────
         handleLlmMessage(msg, canonicalId, text);
     }
@@ -232,6 +244,158 @@ public class GroupSession {
         }
         reply(msg, sb.toString());
     }
+
+    // ── /wiki ──────────────────────────────────────────────────────────────────
+
+    /**
+     * Agentic wiki command — distils conversation into one or more Markdown notes.
+     *
+     * <pre>
+     * /wiki path/to/note                    — summarise messages since last /wiki
+     * /wiki path/to/note user instruction   — same, but follow the user's directive
+     * </pre>
+     *
+     * <p>The LLM receives only the messages added since the previous {@code /wiki} call
+     * (tracked via {@link #wikiCheckpoints}), so repeated calls naturally segment the
+     * conversation without re-processing old material.
+     *
+     * <p>The LLM may produce multiple {@code <wiki_file path="...">...</wiki_file>} blocks
+     * when the user asks for several articles or when the conversation spans distinct topics.
+     * Each block is saved as a separate file in the agent's storage backend.
+     */
+    private void handleWiki(InboundMessage msg, String canonicalId, String args) {
+        if (args.isBlank()) {
+            reply(msg, """
+                    Usage:
+                    • `/wiki <path>` — summarises our conversation since the last /wiki
+                    • `/wiki <path> <instruction>` — same, but follow your directive
+
+                    Examples:
+                      /wiki notes/virtual-threads
+                      /wiki notes/java Напиши подробную статью про сборщик мусора
+                      /wiki notes/ Сохрани GC и virtual threads как отдельные статьи""");
+            return;
+        }
+
+        List<ConversationMessage> history = userHistories.get(canonicalId);
+        if (history == null || history.isEmpty()) {
+            reply(msg, "⚠️ No conversation to summarise yet. Chat with me first, then use /wiki.");
+            return;
+        }
+
+        // ── Extract only messages since last /wiki ────────────────────────────
+        int checkpoint = wikiCheckpoints.getOrDefault(canonicalId, 0);
+        // Guard against history being trimmed between two /wiki calls
+        int from = Math.min(checkpoint, history.size());
+        List<ConversationMessage> newMessages = history.subList(from, history.size());
+
+        if (newMessages.isEmpty()) {
+            reply(msg, "ℹ️ Nothing new since the last /wiki. Start a new topic and then call /wiki again.");
+            return;
+        }
+
+        // ── Parse path and optional instruction ───────────────────────────────
+        int space = args.indexOf(' ');
+        String pathHint   = space == -1 ? args                        : args.substring(0, space);
+        String instruction = space == -1 ? null                       : args.substring(space + 1).trim();
+
+        log.info("[{}] /wiki: summarising {} message(s) since checkpoint {} → '{}'{}",
+                agentConfig.id(), newMessages.size(), checkpoint, pathHint,
+                instruction != null ? " (instruction: \"" + truncate(instruction, 60) + "\")" : "");
+
+        // Signal that we're working
+        transportRegistry.find(msg.transportId()).ifPresent(t -> t.sendTyping(msg.chatId()));
+
+        try {
+            String llmResponse = callWikiAgent(newMessages, pathHint, instruction);
+            List<WikiFile> files = parseWikiFiles(llmResponse, pathHint);
+
+            if (files.isEmpty()) {
+                log.warn("[{}] /wiki: LLM returned no <wiki_file> blocks — raw response: {}",
+                        agentConfig.id(), truncate(llmResponse, 200));
+                reply(msg, "⚠️ The LLM didn't produce a recognisable file block. Try again or rephrase your instruction.");
+                return;
+            }
+
+            // Save each file and collect results
+            var saved   = new ArrayList<String>();
+            var failed  = new ArrayList<String>();
+            for (WikiFile wf : files) {
+                try {
+                    storageBackend.write(wf.path(), wf.content());
+                    log.info("[{}] /wiki: saved {} chars → '{}'", agentConfig.id(), wf.content().length(), wf.path());
+                    saved.add("`" + wf.path() + "`");
+                } catch (StorageException e) {
+                    log.error("[{}] /wiki: failed to write '{}'", agentConfig.id(), wf.path(), e);
+                    failed.add("`" + wf.path() + "` (" + e.getMessage() + ")");
+                }
+            }
+
+            // Update checkpoint so next /wiki only processes new material
+            wikiCheckpoints.put(canonicalId, history.size());
+
+            // Report back
+            var sb = new StringBuilder();
+            if (!saved.isEmpty())  sb.append("✅ Saved: ").append(String.join(", ", saved));
+            if (!failed.isEmpty()) sb.append("\n⚠️ Failed: ").append(String.join(", ", failed));
+            reply(msg, sb.toString());
+
+        } catch (Exception e) {
+            log.error("[{}] /wiki: LLM call failed", agentConfig.id(), e);
+            reply(msg, "⚠️ Could not generate wiki note: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Sends the conversation slice to the LLM with the wiki agent meta-prompt.
+     * Returns the raw LLM output (expected to contain {@code <wiki_file>} blocks).
+     */
+    private String callWikiAgent(List<ConversationMessage> messages, String pathHint, String instruction) {
+        String wikiPrompt = loadWikiPrompt();
+
+        // Format conversation slice as a readable dialogue
+        var dialogue = new StringBuilder();
+        for (ConversationMessage m : messages) {
+            String speaker = m.role() == ConversationMessage.Role.USER ? "User" : "Assistant";
+            dialogue.append(speaker).append(": ").append(m.content()).append("\n\n");
+        }
+
+        var userMessage = new StringBuilder();
+        userMessage.append("Conversation:\n\n---\n")
+                   .append(dialogue.toString().stripTrailing())
+                   .append("\n---\n\n")
+                   .append("Suggested path: `").append(pathHint).append("`");
+        if (instruction != null && !instruction.isBlank()) {
+            userMessage.append("\n\nUser instructions: ").append(instruction);
+        }
+
+        LlmRequest request = new LlmRequest(wikiPrompt, List.of(), userMessage.toString(), "wiki", agentConfig.id());
+        return llmBackend.complete(request).text();
+    }
+
+    /**
+     * Parses {@code <wiki_file path="...">...</wiki_file>} blocks from the LLM response.
+     * Falls back to treating the entire response as a single file at {@code pathHint} if no
+     * blocks are found — improves robustness with models that ignore the format instruction.
+     */
+    private List<WikiFile> parseWikiFiles(String llmResponse, String pathHint) {
+        var files = new ArrayList<WikiFile>();
+        Matcher m = WIKI_FILE_PATTERN.matcher(llmResponse);
+        while (m.find()) {
+            String path    = m.group(1).trim();
+            String content = m.group(2).trim();
+            if (!path.contains(".")) path = path + ".md";
+            files.add(new WikiFile(path, content));
+        }
+        if (files.isEmpty() && !llmResponse.isBlank()) {
+            // Fallback: no markers found — save entire response to the suggested path
+            String path = pathHint.contains(".") ? pathHint : pathHint + ".md";
+            files.add(new WikiFile(path, llmResponse.trim()));
+        }
+        return files;
+    }
+
+    private record WikiFile(String path, String content) {}
 
     // ── Onboarding ─────────────────────────────────────────────────────────────
 
@@ -306,6 +470,19 @@ public class GroupSession {
 
     /** Per-user system prompt overrides (active for this session only). */
     private final Map<String, String> userSystemPromptOverrides = new ConcurrentHashMap<>();
+
+    /**
+     * Tracks history size at the time of the last /wiki call per user.
+     * Used to extract only "new since last save" messages for the next /wiki.
+     * Stored as list size (not an index), so it's naturally bounded by MAX_HISTORY_TURNS.
+     * If the list is trimmed between two /wiki calls, we fall back to all available history.
+     */
+    private final Map<String, Integer> wikiCheckpoints = new ConcurrentHashMap<>();
+
+    /** Pattern that matches LLM-generated wiki file blocks: {@code <wiki_file path="...">...</wiki_file>}. */
+    private static final Pattern WIKI_FILE_PATTERN =
+            Pattern.compile("<wiki_file\\s+path=\"([^\"]+)\">(.*?)</wiki_file>", Pattern.DOTALL);
+
 
     // ── Normal LLM conversation ────────────────────────────────────────────────
 
@@ -413,6 +590,17 @@ public class GroupSession {
             return metaPromptTemplate;
         } catch (IOException e) {
             throw new IllegalStateException("Cannot load meta-prompt from classpath: " + META_PROMPT_PATH, e);
+        }
+    }
+
+    private String loadWikiPrompt() {
+        if (wikiPromptTemplate != null) return wikiPromptTemplate;
+        try {
+            var resource = new ClassPathResource(WIKI_PROMPT_PATH);
+            wikiPromptTemplate = resource.getContentAsString(StandardCharsets.UTF_8);
+            return wikiPromptTemplate;
+        } catch (IOException e) {
+            throw new IllegalStateException("Cannot load wiki meta-prompt from classpath: " + WIKI_PROMPT_PATH, e);
         }
     }
 

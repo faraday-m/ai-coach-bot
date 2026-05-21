@@ -189,10 +189,9 @@ BOT_WEB_PASSWORD=a-strong-password
 | **System Prompt** | Edit and save — applied immediately without restart |
 | **Commands** | Add / edit / delete `/quiz`, `/hint` etc. — applied immediately |
 | **Transports** | Add / edit / remove (transport, chatId) bindings |
-| **Schedules** | Add / edit / delete cron schedules |
+| **Schedules** | Add / edit / delete cron schedules with optional auto-save path |
 
-> Schedule changes (add/edit/delete) require a restart to take effect:  
-> `docker compose restart coach-bot`
+All changes take effect immediately — no restart required.
 
 ---
 
@@ -331,10 +330,92 @@ Cron format — standard 5-field Unix cron: `minute hour day month weekday`
 
 > Wrap multi-word cron expressions in quotes: `schedule add default "* 19 * * *" Tell a joke`
 
+### Scheduled auto-save to storage
+
+Set a **Save to path** on a schedule to automatically persist the LLM-generated response to storage after each broadcast:
+
+```
+> schedule add default "0 20 * * *" "Summarise what I should review tomorrow" journal/{date}
+```
+
+The `{date}` placeholder is replaced with the current date (`YYYY-MM-DD`) in the bot's timezone, so each day's entry goes into a separate file.
+The response is **appended** with a timestamp heading — multiple firings per day accumulate in the same file.
+
+You can also set the save path in the Admin UI → Schedules tab.
+
 **Tip:** set `EDITOR=nano` (or `vim`) to edit prompts in your preferred editor:
 
 ```bash
 docker compose run --rm -e EDITOR=nano coach-bot --mode=manage
+```
+
+---
+
+## Knowledge capture — `/wiki`
+
+At any point in a conversation you can ask the bot to distil what was covered into a Markdown note and save it to the agent's storage backend (filesystem or Obsidian vault).
+
+### Basic usage
+
+```
+/wiki notes/virtual-threads
+```
+
+The LLM reads the conversation **since your last `/wiki` call** (not the entire history) and produces a structured note:
+
+```markdown
+# Virtual Threads in Java 21
+
+## Summary
+Discussion of Project Loom's virtual threads…
+
+## Key concepts
+- Virtual threads are cheap — millions can exist simultaneously
+- Mounted/unmounted from carrier threads at blocking points
+…
+
+## Solutions / Approaches
+…
+
+## Takeaways
+- Prefer virtual threads for IO-bound tasks
+- Don't pool virtual threads
+…
+```
+
+The checkpoint advances after each save, so the next `/wiki` captures only the new part of the conversation — handy for long sessions or daily journals.
+
+### With an instruction
+
+Pass a directive after the path to guide what gets generated:
+
+```
+/wiki notes/gc  Напиши подробную статью про сборщик мусора в Java, не просто суммаризацию
+```
+
+The instruction overrides the default summary structure — the LLM can write a full article, add extra context, or focus on a specific subtopic.
+
+### Multiple files (agentic mode)
+
+The LLM can create several files in one call when the conversation spans distinct topics:
+
+```
+/wiki notes/  Сохрани GC и virtual threads как отдельные статьи
+```
+
+Bot reply:
+```
+✅ Saved: `notes/gc-algorithms.md`, `notes/virtual-threads.md`
+```
+
+Under the hood the LLM uses `<wiki_file path="...">...</wiki_file>` blocks; the bot parses and saves each one. If the model doesn't follow the format, the full response is saved to the given path (fallback).
+
+### Verbatim save
+
+Provide content explicitly to skip the LLM entirely:
+
+```
+/wiki notes/standup Shipped scheduler hot-reload, fixed gitignore comment bug
 ```
 
 ---
