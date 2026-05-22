@@ -17,6 +17,10 @@ User (Telegram / Jabber / Console / Web chat)
                     ┌──────────┴──────────┐
                  Agent Loop           Memory
                (tool calls)      (per-user .md)
+                                       │
+                               Spaced Review
+                              (cron → smart
+                               daily nudge)
 ```
 
 ---
@@ -295,6 +299,8 @@ The memory is injected into every LLM request as hidden context, so the bot reme
 
 Memory files are stored at `coach-bot/memory/<agentId>/<userId>.md` in the agent's storage backend.
 
+The memory document is also the data source for **spaced repetition** — see [Scheduled tasks → Spaced review](#spaced-review) below.
+
 ---
 
 ## Tool Use (Claude backend)
@@ -318,7 +324,7 @@ The loop runs for up to 10 steps. Other backends (Gemini, OpenAI, Ollama) do not
 
 ---
 
-## Scheduled broadcasts
+## Scheduled tasks
 
 ```bash
 docker compose run --rm coach-bot --mode=manage
@@ -346,6 +352,27 @@ Set a **Save to path** to automatically persist the LLM response after each broa
 ```
 
 The `{date}` placeholder is replaced with the current date (`YYYY-MM-DD`). The response is **appended** with a timestamp heading — multiple firings per day accumulate in the same file.
+
+### Spaced review
+
+Set `schedule_type = 'spaced_review'` to turn a cron schedule into a personalised **spaced-repetition trainer**. Instead of broadcasting a static prompt, the scheduler reads each user's [memory document](#agent-memory) and uses SM-2-like intervals to decide whether any topic is due for review:
+
+| Confidence level | Review interval |
+|---|---|
+| ⬇️ Needs work | After 1–2 days |
+| ➡️ Familiar | After 5–7 days |
+| ⬆️ Confident | After 14–21 days |
+
+If a topic is due, the bot sends a short personalised message with an opening question. If nothing is due today, it stays silent — no spam.
+
+Insert a spaced-review schedule directly in the database (no CLI support yet — the Vaadin UI shows it as a regular schedule):
+
+```sql
+INSERT INTO agent_schedules (agent_id, cron, prompt, schedule_type, enabled)
+VALUES ('java-coach', '0 9 * * *', '', 'spaced_review', 1);
+```
+
+The `prompt` field is ignored for `spaced_review` schedules — the built-in `spaced-review.md` meta-prompt is always used. Memory is populated automatically after each `/wiki` save.
 
 ---
 
@@ -464,8 +491,9 @@ docker compose run --rm coach-bot --mode=manage
 > command enable 1  /  command disable 1  /  command rm 1
 
 > schedule list default
-> schedule add default "0 9 * * MON-FRI" Give me a morning Java question
+> schedule add default "0 9 * * MON-FRI" Give me a morning Java question   # broadcast
 > schedule enable 1  /  schedule disable 1  /  schedule rm 1
+# For spaced_review type — insert directly via SQL (see Scheduled tasks section)
 
 > help
 > exit
@@ -578,7 +606,7 @@ src/main/java/dev/coachbot/
 ├── memory/         MemoryService          — per-user learning memory (async update)
 ├── onboarding/     OnboardingFlow         — 9-step FSM → LLM-generated system prompt + commands
 │                   OnboardWizard          — --mode=onboard CLI
-├── scheduler/      AgentScheduler         — cron-based broadcast messages
+├── scheduler/      AgentScheduler         — cron-based broadcast + spaced-review schedules
 │                   ScheduleRepository     — SQLite CRUD for schedules
 ├── storage/        filesystem / obsidian
 ├── tool/           WriteFileTool / ReadFileTool / ListFilesTool

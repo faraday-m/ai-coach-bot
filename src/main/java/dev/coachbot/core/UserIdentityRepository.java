@@ -59,6 +59,17 @@ public class UserIdentityRepository implements UserIdentityStore {
     }
 
     /**
+     * Returns all transport keys (e.g. {@code "telegram:123456789"}) registered
+     * to the given canonical user ID.
+     */
+    @Override
+    public List<String> findTransportKeysByCanonicalId(String canonicalId) {
+        return jdbc.queryForList(
+                "SELECT transport_key FROM user_identities WHERE canonical_id = ?",
+                String.class, canonicalId);
+    }
+
+    /**
      * Links {@code fromTransportKey} to {@code toCanonicalId}.
      *
      * <p>Finds the canonical ID currently assigned to {@code fromTransportKey},

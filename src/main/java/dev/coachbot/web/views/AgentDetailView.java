@@ -19,6 +19,7 @@ import com.vaadin.flow.component.orderedlayout.FlexComponent;
 import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
 import com.vaadin.flow.component.orderedlayout.VerticalLayout;
 import com.vaadin.flow.component.tabs.TabSheet;
+import com.vaadin.flow.component.select.Select;
 import com.vaadin.flow.component.textfield.TextArea;
 import com.vaadin.flow.component.textfield.TextField;
 import com.vaadin.flow.router.BeforeEnterEvent;
@@ -387,7 +388,10 @@ public class AgentDetailView extends VerticalLayout implements BeforeEnterObserv
     private Component schedulesTab() {
         var grid = new Grid<AgentSchedule>(AgentSchedule.class, false);
         grid.addColumn(AgentSchedule::cron).setHeader("Cron").setAutoWidth(true);
-        grid.addColumn(AgentSchedule::prompt).setHeader("Prompt").setFlexGrow(1);
+        grid.addColumn(s -> "spaced_review".equals(s.scheduleType()) ? "♻️ Spaced review" : "Broadcast")
+                .setHeader("Type").setAutoWidth(true);
+        grid.addColumn(s -> "spaced_review".equals(s.scheduleType()) ? "—" : s.prompt())
+                .setHeader("Prompt").setFlexGrow(1);
         grid.addColumn(s -> s.savePath() != null ? s.savePath() : "—").setHeader("Save to").setAutoWidth(true);
         grid.addComponentColumn(s -> {
             var edit = new Button("Edit");
@@ -401,7 +405,7 @@ public class AgentDetailView extends VerticalLayout implements BeforeEnterObserv
             toggle.addClickListener(e -> {
                 boolean enable = !s.enabled();
                 scheduleRepo.setEnabled(s.id(), enable);
-                if (enable) agentScheduler.register(new AgentSchedule(s.id(), s.agentId(), s.cron(), s.prompt(), true, s.savePath()));
+                if (enable) agentScheduler.register(new AgentSchedule(s.id(), s.agentId(), s.cron(), s.prompt(), true, s.savePath(), s.scheduleType()));
                 else        agentScheduler.cancel(s.id());
                 grid.setItems(scheduleRepo.findByAgent(agent.id()));
             });
@@ -426,6 +430,12 @@ public class AgentDetailView extends VerticalLayout implements BeforeEnterObserv
         cronField.setWidth("160px");
         cronField.setHelperText("min hour day month weekday");
 
+        var typeSelect = new Select<String>();
+        typeSelect.setItems("broadcast", "spaced_review");
+        typeSelect.setValue("broadcast");
+        typeSelect.setItemLabelGenerator(t -> "spaced_review".equals(t) ? "Spaced review" : "Broadcast");
+        typeSelect.setWidth("150px");
+
         var promptField = new TextArea();
         promptField.setPlaceholder("Give me a Java interview question to start the day");
         promptField.setMinHeight("60px");
@@ -436,26 +446,43 @@ public class AgentDetailView extends VerticalLayout implements BeforeEnterObserv
         savePathField.setWidth("200px");
         savePathField.setHelperText("Storage path; {date} = today");
 
+        // Disable prompt field when spaced_review is chosen — it's not used
+        typeSelect.addValueChangeListener(e -> {
+            boolean isSr = "spaced_review".equals(e.getValue());
+            promptField.setEnabled(!isSr);
+            promptField.setHelperText(isSr
+                    ? "Not used — built-in spaced-review meta-prompt is applied automatically"
+                    : null);
+            if (isSr) promptField.clear();
+        });
+
         var addBtn = new Button("Add Schedule");
         addBtn.addThemeVariants(ButtonVariant.LUMO_PRIMARY, ButtonVariant.LUMO_SMALL);
         addBtn.addClickListener(e -> {
+            String type     = typeSelect.getValue();
             String cron     = cronField.getValue().trim();
             String prompt   = promptField.getValue().trim();
             String savePath = savePathField.getValue().trim();
-            if (cron.isEmpty() || prompt.isEmpty()) {
-                notify("Both cron and prompt are required.", true);
+            if (cron.isEmpty()) {
+                notify("Cron expression is required.", true);
                 return;
             }
-            long id = scheduleRepo.insert(agent.id(), cron, prompt, savePath);
-            agentScheduler.register(new AgentSchedule(id, agent.id(), cron, prompt, true, savePath.isEmpty() ? null : savePath));
+            if (!"spaced_review".equals(type) && prompt.isEmpty()) {
+                notify("Prompt is required for broadcast schedules.", true);
+                return;
+            }
+            long id = scheduleRepo.insert(agent.id(), cron, prompt, savePath, type);
+            agentScheduler.register(new AgentSchedule(id, agent.id(), cron, prompt, true,
+                    savePath.isEmpty() ? null : savePath, type));
             grid.setItems(scheduleRepo.findByAgent(agent.id()));
             cronField.clear();
             promptField.clear();
             savePathField.clear();
+            typeSelect.setValue("broadcast");
             notify("Schedule added and activated.", false);
         });
 
-        var addRow = new HorizontalLayout(cronField, promptField, savePathField, addBtn);
+        var addRow = new HorizontalLayout(cronField, typeSelect, promptField, savePathField, addBtn);
         addRow.setDefaultVerticalComponentAlignment(FlexComponent.Alignment.END);
         addRow.setWidthFull();
         addRow.expand(promptField);
@@ -477,10 +504,22 @@ public class AgentDetailView extends VerticalLayout implements BeforeEnterObserv
         cronField.setHelperText("5 fields: minute hour day month weekday");
         cronField.setWidthFull();
 
+        var typeSelect = new Select<String>();
+        typeSelect.setLabel("Type");
+        typeSelect.setItems("broadcast", "spaced_review");
+        typeSelect.setValue(schedule.scheduleType());
+        typeSelect.setItemLabelGenerator(t -> "spaced_review".equals(t) ? "Spaced review" : "Broadcast");
+        typeSelect.setWidthFull();
+
+        boolean isSrInitially = "spaced_review".equals(schedule.scheduleType());
         var promptField = new TextArea("Prompt");
-        promptField.setValue(schedule.prompt());
+        promptField.setValue(schedule.prompt() != null ? schedule.prompt() : "");
         promptField.setMinHeight("100px");
         promptField.setWidthFull();
+        promptField.setEnabled(!isSrInitially);
+        if (isSrInitially) {
+            promptField.setHelperText("Not used — built-in spaced-review meta-prompt is applied automatically");
+        }
 
         var savePathField = new TextField("Save to (optional)");
         savePathField.setValue(schedule.savePath() != null ? schedule.savePath() : "");
@@ -488,21 +527,34 @@ public class AgentDetailView extends VerticalLayout implements BeforeEnterObserv
         savePathField.setHelperText("Storage path; supports {date} placeholder. Leave empty to not save.");
         savePathField.setWidthFull();
 
-        var content = new VerticalLayout(cronField, promptField, savePathField);
+        typeSelect.addValueChangeListener(e -> {
+            boolean isSr = "spaced_review".equals(e.getValue());
+            promptField.setEnabled(!isSr);
+            promptField.setHelperText(isSr
+                    ? "Not used — built-in spaced-review meta-prompt is applied automatically"
+                    : null);
+            if (isSr) promptField.clear();
+        });
+
+        var content = new VerticalLayout(cronField, typeSelect, promptField, savePathField);
         content.setPadding(false);
         dialog.add(content);
 
         var cancel = new Button("Cancel", e -> dialog.close());
         var save = new Button("Save", e -> {
+            String type     = typeSelect.getValue();
             String cron     = cronField.getValue().trim();
             String prompt   = promptField.getValue().trim();
             String savePath = savePathField.getValue().trim();
-            if (cron.isEmpty() || prompt.isEmpty()) { notify("Both cron and prompt are required.", true); return; }
-            scheduleRepo.update(schedule.id(), cron, prompt, savePath);
+            if (cron.isEmpty()) { notify("Cron expression is required.", true); return; }
+            if (!"spaced_review".equals(type) && prompt.isEmpty()) {
+                notify("Prompt is required for broadcast schedules.", true); return;
+            }
+            scheduleRepo.update(schedule.id(), cron, prompt, savePath, type);
             agentScheduler.cancel(schedule.id());
             if (schedule.enabled()) {
                 agentScheduler.register(new AgentSchedule(schedule.id(), schedule.agentId(), cron, prompt, true,
-                        savePath.isEmpty() ? null : savePath));
+                        savePath.isEmpty() ? null : savePath, type));
             }
             grid.setItems(scheduleRepo.findByAgent(agent.id()));
             dialog.close();

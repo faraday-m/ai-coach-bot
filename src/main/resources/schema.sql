@@ -67,14 +67,18 @@ CREATE TABLE IF NOT EXISTS agent_commands (
 -- Scheduled tasks: fire a prompt at a cron schedule and broadcast the LLM reply
 -- to all transport/chat pairs this agent is registered on.
 CREATE TABLE IF NOT EXISTS agent_schedules (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id    TEXT    NOT NULL,
-    cron        TEXT    NOT NULL,   -- standard 5-part cron: "0 9 * * MON-FRI"
-    prompt      TEXT    NOT NULL,   -- text sent to the LLM when this schedule fires
-    save_path   TEXT,               -- optional: also save LLM response to storage at this path
-                                    --   supports {date} placeholder → replaced with YYYY-MM-DD
-    enabled     INTEGER NOT NULL DEFAULT 1,
-    created_at  TEXT,
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id      TEXT    NOT NULL,
+    cron          TEXT    NOT NULL,   -- standard 5-part cron: "0 9 * * MON-FRI"
+    prompt        TEXT    NOT NULL,   -- text sent to the LLM when this schedule fires
+    save_path     TEXT,               -- optional: also save LLM response to storage at this path
+                                      --   supports {date} placeholder → replaced with YYYY-MM-DD
+    schedule_type TEXT    NOT NULL DEFAULT 'broadcast',
+                                      -- 'broadcast'    — sends the same LLM reply to all bindings
+                                      -- 'spaced_review' — reads each user's memory and sends a
+                                      --                   personalised review only when a topic is due
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT,
     FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
 );
 -- Note: migrations for older databases are handled programmatically

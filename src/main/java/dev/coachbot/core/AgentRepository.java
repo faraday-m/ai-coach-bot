@@ -84,6 +84,16 @@ public class AgentRepository {
         return rows.isEmpty() ? java.util.Optional.empty() : java.util.Optional.of(rows.get(0));
     }
 
+    /**
+     * Returns all canonical user IDs that have ever conversed with the given agent.
+     * Used by the spaced-review scheduler to iterate over per-user memory files.
+     */
+    public List<String> findUsersByAgent(String agentId) {
+        return jdbc.queryForList(
+                "SELECT canonical_user_id FROM conversations WHERE agent_id = ?",
+                String.class, agentId);
+    }
+
     /** Returns all (transportId, chatId) pairs for a given agent. */
     public List<TransportBinding> findTransports(String agentId) {
         return jdbc.query(

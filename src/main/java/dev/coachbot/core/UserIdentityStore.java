@@ -24,6 +24,17 @@ public interface UserIdentityStore {
     String resolve(String transportId, String senderId);
 
     /**
+     * Returns all transport keys registered to the given canonical user ID.
+     *
+     * <p>Default implementation returns an empty list — only {@link UserIdentityRepository}
+     * provides a real DB-backed result. Tests that don't care about transport-key lookup
+     * can leave this as-is.
+     */
+    default java.util.List<String> findTransportKeysByCanonicalId(String canonicalId) {
+        return java.util.List.of();
+    }
+
+    /**
      * Links {@code fromTransportKey} to an existing canonical ID.
      *
      * <p>All transport keys previously associated with {@code fromTransportKey}'s
