@@ -1,5 +1,6 @@
 package dev.coachbot.onboarding;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.coachbot.llm.ConversationMessage;
 import dev.coachbot.llm.LlmBackend;
 import dev.coachbot.llm.LlmRequest;
@@ -113,7 +114,7 @@ public class OnboardingFlow {
         return DEFAULT_QUESTIONS;
     }
 
-    // ── Result type ────────────────────────────────────────────────────────────
+    // ── Result types ───────────────────────────────────────────────────────────
 
     /** Sealed result returned by {@link #answer(String, LlmBackend, String)}. */
     public sealed interface StepResult {
@@ -122,6 +123,14 @@ public class OnboardingFlow {
         /** All questions answered; the generated prompt is ready. */
         record Done(String generatedPrompt) implements StepResult {}
     }
+
+    /**
+     * A slash-command suggested by the LLM after onboarding is complete.
+     *
+     * @param trigger     e.g. {@code "/reactive"} — always starts with {@code /}
+     * @param description e.g. {@code "Reactive programming deep dive"}
+     */
+    public record GeneratedCommand(String trigger, String description) {}
 
     // ── Public API ─────────────────────────────────────────────────────────────
 
@@ -168,6 +177,35 @@ public class OnboardingFlow {
         return STEP_KEYS.size();
     }
 
+    /**
+     * Generates topic-specific slash-commands from the completed learner profile.
+     *
+     * <p>Must be called only after {@link #answer} has returned {@link StepResult.Done}.
+     * Makes one LLM call and parses the JSON array response.
+     *
+     * @param llm        the same LLM backend used for prompt generation
+     * @param metaPrompt the {@code generate-commands.md} template (must contain {@code {profile}})
+     * @return list of suggested commands, or an empty list if the LLM call fails or returns
+     *         unparseable output
+     */
+    public List<GeneratedCommand> generateCommands(LlmBackend llm, String metaPrompt) {
+        String profile = buildProfileText();
+        String systemMessage = metaPrompt.replace("{profile}", profile);
+        LlmRequest request = LlmRequest.of(
+                systemMessage,
+                List.of(),
+                "Generate slash-commands based on the profile above.",
+                "onboarding",
+                "onboarding"
+        );
+        try {
+            String raw = llm.complete(request).text();
+            return parseCommands(raw);
+        } catch (Exception e) {
+            return List.of();
+        }
+    }
+
     // ── Internal ──────────────────────────────────────────────────────────────
 
     private String generatePrompt(LlmBackend llm, String metaPromptTemplate) {
@@ -191,5 +229,55 @@ public class OnboardingFlow {
             sb.append(label).append(": ").append(e.getValue()).append('\n');
         }
         return sb.toString().stripTrailing();
+    }
+
+    /**
+     * Parses LLM output into a list of {@link GeneratedCommand}.
+     *
+     * <p>Handles common LLM quirks: leading/trailing markdown code fences ({@code ```json … ```}),
+     * extra text before/after the array, and missing {@code /} prefix on triggers.
+     */
+    @SuppressWarnings("unchecked")
+    private List<GeneratedCommand> parseCommands(String raw) {
+        if (raw == null || raw.isBlank()) return List.of();
+
+        // Strip markdown code fences if present
+        String text = raw.strip();
+        if (text.startsWith("```")) {
+            text = text.replaceFirst("^```[a-z]*\\s*", "").replaceFirst("```\\s*$", "").strip();
+        }
+
+        // Extract the outermost JSON array
+        int start = text.indexOf('[');
+        int end   = text.lastIndexOf(']');
+        if (start < 0 || end <= start) return List.of();
+        text = text.substring(start, end + 1);
+
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            List<Map<String, String>> list = mapper.readValue(
+                    text, mapper.getTypeFactory().constructCollectionType(List.class, Map.class));
+
+            return list.stream()
+                    .filter(m -> m.containsKey("trigger") && m.containsKey("description"))
+                    .map(m -> {
+                        String trigger = m.get("trigger").trim().toLowerCase();
+                        // Ensure leading slash
+                        if (!trigger.startsWith("/")) trigger = "/" + trigger;
+                        // Keep only /[a-z0-9_] — replace everything else with _
+                        trigger = "/" + trigger.substring(1).replaceAll("[^a-z0-9_]", "_");
+                        // Enforce max length (Telegram limit: 32 chars for the trigger part)
+                        if (trigger.length() > 33) trigger = trigger.substring(0, 33);
+                        String description = m.get("description").trim();
+                        if (description.length() > 256) description = description.substring(0, 256);
+                        return new GeneratedCommand(trigger, description);
+                    })
+                    .filter(c -> c.trigger().length() >= 2)   // at minimum "/x"
+                    .distinct()
+                    .limit(7)
+                    .toList();
+        } catch (Exception e) {
+            return List.of();
+        }
     }
 }

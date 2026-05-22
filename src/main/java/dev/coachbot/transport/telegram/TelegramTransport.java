@@ -8,6 +8,7 @@ import com.pengrad.telegrambot.model.User;
 import com.pengrad.telegrambot.model.botcommandscope.BotCommandsScopeChat;
 import com.pengrad.telegrambot.request.DeleteMyCommands;
 import com.pengrad.telegrambot.request.GetUpdates;
+import com.pengrad.telegrambot.model.request.ParseMode;
 import com.pengrad.telegrambot.request.SendChatAction;
 import com.pengrad.telegrambot.request.SendMessage;
 import com.pengrad.telegrambot.request.SetMyCommands;
@@ -100,10 +101,24 @@ public class TelegramTransport implements TransportPlugin {
         if (!StringUtils.hasText(text)) return;
         // Telegram has a 4096-char limit per message — split if needed
         for (String chunk : splitIfNeeded(text, 4096)) {
-            var response = bot.execute(new SendMessage(chatId, chunk));
-            if (!response.isOk()) {
-                log.warn("Telegram sendMessage failed for chat {}: {}", chatId, response.description());
-            }
+            sendChunk(chatId, chunk);
+        }
+    }
+
+    /**
+     * Sends a single chunk as HTML (converted from Markdown). Falls back to plain text
+     * if Telegram rejects the HTML — e.g. when the LLM produces malformed tags or
+     * unclosed entities that survive the converter.
+     */
+    private void sendChunk(String chatId, String chunk) {
+        String html = TelegramMarkdown.toHtml(chunk);
+        var response = bot.execute(new SendMessage(chatId, html).parseMode(ParseMode.HTML));
+        if (response.isOk()) return;
+
+        log.debug("Telegram HTML send failed ({}), retrying as plain text", response.description());
+        response = bot.execute(new SendMessage(chatId, chunk));
+        if (!response.isOk()) {
+            log.warn("Telegram sendMessage failed for chat {}: {}", chatId, response.description());
         }
     }
 

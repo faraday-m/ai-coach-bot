@@ -61,6 +61,7 @@ public class GroupSession {
     private static final String META_PROMPT_PATH      = "prompts/meta/generate-coach-prompt.md";
     private static final String WIKI_PROMPT_PATH      = "prompts/meta/wiki-summary.md";
     private static final String MEMORY_PROMPT_PATH    = "prompts/meta/memory-update.md";
+    private static final String COMMANDS_PROMPT_PATH  = "prompts/meta/generate-commands.md";
 
     private volatile AgentConfig agentConfig;
     private final LlmBackend llmBackend;
@@ -77,6 +78,8 @@ public class GroupSession {
     private volatile String wikiPromptTemplate;
     /** Lazily loaded meta-prompt template for memory updates. */
     private volatile String memoryPromptTemplate;
+    /** Lazily loaded meta-prompt template for post-onboarding command generation. */
+    private volatile String commandsPromptTemplate;
 
     /** Manages the persistent per-user learning-memory document. Initialised lazily. */
     private volatile MemoryService memoryService;
@@ -541,6 +544,13 @@ public class GroupSession {
 
                     reply(msg, "✅ Onboarding complete! Your personalised coaching style is ready.\n\n" +
                             "Let's get started! What would you like to work on?");
+
+                    // Generate topic commands in a background virtual thread so the user
+                    // gets the confirmation reply immediately and commands follow shortly after.
+                    final OnboardingFlow completedFlow = flow;
+                    Thread.ofVirtual()
+                            .name("onboard-commands-" + agentConfig.id())
+                            .start(() -> generateAndSaveCommands(msg, completedFlow));
                 }
             }
         } catch (Exception e) {
@@ -707,6 +717,67 @@ public class GroupSession {
             return memoryPromptTemplate;
         } catch (IOException e) {
             throw new IllegalStateException("Cannot load memory meta-prompt from classpath: " + MEMORY_PROMPT_PATH, e);
+        }
+    }
+
+    private String loadCommandsPrompt() {
+        if (commandsPromptTemplate != null) return commandsPromptTemplate;
+        try {
+            var resource = new ClassPathResource(COMMANDS_PROMPT_PATH);
+            commandsPromptTemplate = resource.getContentAsString(StandardCharsets.UTF_8);
+            return commandsPromptTemplate;
+        } catch (IOException e) {
+            throw new IllegalStateException("Cannot load commands meta-prompt from classpath: " + COMMANDS_PROMPT_PATH, e);
+        }
+    }
+
+    /**
+     * Called in a background virtual thread after onboarding completes.
+     *
+     * <p>Makes one LLM call to generate topic-specific slash-commands, saves them to the DB,
+     * refreshes the in-memory command list, updates the Telegram command menu, and sends a
+     * follow-up message to the user listing the new commands.
+     */
+    private void generateAndSaveCommands(InboundMessage msg, OnboardingFlow flow) {
+        try {
+            List<OnboardingFlow.GeneratedCommand> generated =
+                    flow.generateCommands(llmBackend, loadCommandsPrompt());
+
+            if (generated.isEmpty()) {
+                log.warn("[{}] Post-onboarding command generation returned no commands.", agentConfig.id());
+                return;
+            }
+
+            for (OnboardingFlow.GeneratedCommand cmd : generated) {
+                commandRepository.insertOrReplace(agentConfig.id(), cmd.trigger(), cmd.description());
+            }
+            log.info("[{}] Post-onboarding: {} command(s) saved.", agentConfig.id(), generated.size());
+
+            // Reload in-memory list so commands work immediately without restart
+            commands = commandRepository.findEnabledByAgent(agentConfig.id());
+
+            // Update Telegram (or other transport) command menus for all bindings of this agent
+            List<dev.coachbot.transport.TransportPlugin.CommandEntry> entries = commands.stream()
+                    .map(c -> new dev.coachbot.transport.TransportPlugin.CommandEntry(c.trigger(), c.description()))
+                    .toList();
+            agentRepository.findTransports(agentConfig.id()).forEach(binding ->
+                    transportRegistry.find(binding.transportId()).ifPresent(t -> {
+                        try { t.registerCommands(binding.chatId(), entries); }
+                        catch (Exception e) {
+                            log.warn("[{}] Failed to sync command menu to {}:{}",
+                                    agentConfig.id(), binding.transportId(), binding.chatId(), e);
+                        }
+                    })
+            );
+
+            // Notify the user
+            String list = generated.stream()
+                    .map(c -> c.trigger() + " — " + c.description())
+                    .collect(java.util.stream.Collectors.joining("\n"));
+            reply(msg, "📋 I've set up quick commands for your topics:\n\n" + list);
+
+        } catch (Exception e) {
+            log.warn("[{}] Failed to generate commands after onboarding.", agentConfig.id(), e);
         }
     }
 

@@ -78,4 +78,14 @@ public class CommandRepository {
     public void delete(long id) {
         jdbc.update("DELETE FROM agent_commands WHERE id = ?", id);
     }
+
+    /**
+     * Inserts a new command or replaces the existing one with the same (agent_id, trigger) pair.
+     * Used by post-onboarding command generation to keep commands fresh across re-onboards.
+     */
+    public void insertOrReplace(String agentId, String trigger, String description) {
+        jdbc.update(
+                "INSERT OR REPLACE INTO agent_commands (agent_id, trigger, description, enabled, created_at) VALUES (?,?,?,1,?)",
+                agentId, trigger, description, Instant.now().toString());
+    }
 }

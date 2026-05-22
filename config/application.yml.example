@@ -19,8 +19,10 @@ bot:
   llm:
 
     # Pick ONE of the blocks below (or enable multiple and point agents at them).
+    # Claude is the only backend that supports native tool use (read/write/list files)
+    # and token-by-token streaming to the web chat frontend.
 
-    # Option A — Anthropic Claude (official API key)
+    # Option A — Anthropic Claude (tool use + streaming)
     claude:
       enabled: true
       api-key: "${ANTHROPIC_API_KEY}"        # sk-ant-api03-...
@@ -32,7 +34,7 @@ bot:
     #   api-key: "${GEMINI_API_KEY}"
     #   model: "gemini-2.0-flash"
 
-    # Option C — OpenAI or compatible (Groq, LM Studio, Together AI …)
+    # Option C — OpenAI or compatible (Groq, Together AI, LM Studio …)
     # openai:
     #   enabled: true
     #   api-key: "${OPENAI_API_KEY}"
@@ -44,6 +46,7 @@ bot:
     #   enabled: true
     #   base-url: "http://localhost:11434"     # or http://ollama:11434 inside Docker
     #   model: "gemma3:12b"
+    #   timeout-seconds: 300
 
   # ── Transports ──────────────────────────────────────────────────────────────
   transports:
@@ -52,6 +55,9 @@ bot:
     telegram:
       enabled: true
       token: "${TELEGRAM_BOT_TOKEN}"
+    # Web chat React frontend (start with: docker compose --profile webchat up)
+    # webchat:
+    #   enabled: true
 
   # ── Storage ──────────────────────────────────────────────────────────────────
   storage:
@@ -61,6 +67,19 @@ bot:
     # obsidian:
     #   enabled: true
     #   vault-path: "${OBSIDIAN_VAULT_PATH:/obsidian}"
+    #   notes-subfolder: "coach-bot"          # subfolder inside the vault
+
+  # ── Credential providers (optional) ─────────────────────────────────────────
+  # By default all keys are read from environment variables.
+  # Uncomment to pull secrets from HashiCorp Vault instead:
+  # credentials:
+  #   vault:
+  #     enabled: true
+  #     url: "${VAULT_ADDR:http://localhost:8200}"
+  #     token: "${VAULT_TOKEN}"
+  #     secret-path: "secret/data/coach-bot"
+  # Then on each backend: credential-provider: vault
+  #                        api-key-name: ANTHROPIC_API_KEY
 
 # ── Agents (seed — only applied on first run if the DB is empty) ──────────────
 seeds:
@@ -75,3 +94,15 @@ seeds:
       transports:
         - transport-id: telegram
           chat-id: "${TELEGRAM_CHAT_ID}"     # e.g. -1001234567890 for a group
+
+    # Multiple agents example — different triggers in the same chat:
+    # - id: english-coach
+    #   name: "English Coach"
+    #   system-prompt: "You are an English language coach..."
+    #   llm-backend: gemini
+    #   storage-backend: filesystem
+    #   trigger: "@English"
+    #   require-trigger: true
+    #   transports:
+    #     - transport-id: telegram
+    #       chat-id: "${TELEGRAM_CHAT_ID}"
