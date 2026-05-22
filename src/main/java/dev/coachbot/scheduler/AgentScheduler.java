@@ -40,6 +40,7 @@ import java.util.concurrent.TimeUnit;
  * Spring's {@link CronExpression} is used for parsing and next-fire calculation.
  */
 @Service
+@org.springframework.context.annotation.DependsOn("schemaMigration")
 public class AgentScheduler {
 
     private static final Logger log = LoggerFactory.getLogger(AgentScheduler.class);
@@ -180,7 +181,7 @@ public class AgentScheduler {
         log.info("Schedule #{} firing: agent='{}' prompt='{}'",
                 schedule.id(), agent.id(), truncate(schedule.prompt(), 80));
 
-        LlmRequest request = new LlmRequest(
+        LlmRequest request = LlmRequest.of(
                 agent.systemPrompt(), List.of(), schedule.prompt(), "scheduler", agent.id());
         String response;
         try {

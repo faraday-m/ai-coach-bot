@@ -79,7 +79,7 @@ public class GeminiBackend implements LlmBackend {
     @Override
     public LlmResponse complete(LlmRequest request) {
         Response<AiMessage> response = model.generate(buildMessages(request));
-        return new LlmResponse(response.content().text());
+        return LlmResponse.text(response.content().text());
     }
 
     private List<ChatMessage> buildMessages(LlmRequest request) {
@@ -89,8 +89,13 @@ public class GeminiBackend implements LlmBackend {
         }
         for (ConversationMessage m : request.history()) {
             messages.add(switch (m.role()) {
-                case USER      -> UserMessage.from(m.content());
-                case ASSISTANT -> AiMessage.from(m.content());
+                case USER        -> UserMessage.from(m.content());
+                case ASSISTANT   -> AiMessage.from(m.content());
+                case TOOL_RESULT -> {
+                    // Tool result handling is not native on Gemini backend — surface as user message.
+                    log.debug("[gemini] TOOL_RESULT in history — injecting as user message");
+                    yield UserMessage.from(m.content());
+                }
             });
         }
         messages.add(UserMessage.from(request.userMessage()));

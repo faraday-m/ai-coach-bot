@@ -1,12 +1,16 @@
 package dev.coachbot.transport.telegram;
 
 import com.pengrad.telegrambot.TelegramBot;
+import com.pengrad.telegrambot.model.BotCommand;
 import com.pengrad.telegrambot.model.Message;
 import com.pengrad.telegrambot.model.Update;
 import com.pengrad.telegrambot.model.User;
+import com.pengrad.telegrambot.model.botcommandscope.BotCommandsScopeChat;
+import com.pengrad.telegrambot.request.DeleteMyCommands;
 import com.pengrad.telegrambot.request.GetUpdates;
 import com.pengrad.telegrambot.request.SendChatAction;
 import com.pengrad.telegrambot.request.SendMessage;
+import com.pengrad.telegrambot.request.SetMyCommands;
 import com.pengrad.telegrambot.response.GetUpdatesResponse;
 import dev.coachbot.transport.InboundMessage;
 import dev.coachbot.transport.InboundMessageHandler;
@@ -20,6 +24,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -105,6 +110,49 @@ public class TelegramTransport implements TransportPlugin {
     @Override
     public void sendTyping(String chatId) {
         bot.execute(new SendChatAction(chatId, "typing"));
+    }
+
+    /**
+     * Registers the given commands in Telegram's "/" menu for a specific chat.
+     *
+     * <p>Telegram requires command names to be lowercase, 1–32 chars, only {@code [a-z0-9_]}.
+     * The leading slash is stripped automatically.  Commands not matching this format are
+     * skipped with a warning.
+     *
+     * <p>An empty list clears the chat's command menu (falls back to the bot-level default).
+     */
+    @Override
+    public void registerCommands(String chatId, List<CommandEntry> commands) {
+        var scope = new BotCommandsScopeChat(parseChatId(chatId));
+        if (commands.isEmpty()) {
+            var resp = bot.execute(new DeleteMyCommands().scope(scope));
+            if (!resp.isOk()) {
+                log.warn("Telegram deleteMyCommands failed for chat {}: {}", chatId, resp.description());
+            }
+            return;
+        }
+
+        BotCommand[] botCmds = commands.stream()
+                .map(e -> {
+                    // Strip leading slash; Telegram needs bare command name
+                    String name = e.trigger().startsWith("/") ? e.trigger().substring(1) : e.trigger();
+                    return new BotCommand(name.toLowerCase(), e.description());
+                })
+                .filter(c -> c.command().matches("[a-z0-9_]{1,32}"))
+                .toArray(BotCommand[]::new);
+
+        if (botCmds.length == 0) {
+            log.debug("registerCommands: no valid commands for chat {} — skipping", chatId);
+            return;
+        }
+
+        var resp = bot.execute(new SetMyCommands(botCmds).scope(scope));
+        if (resp.isOk()) {
+            log.info("Telegram commands registered for chat {}: {}",
+                    chatId, Arrays.stream(botCmds).map(BotCommand::command).toList());
+        } else {
+            log.warn("Telegram setMyCommands failed for chat {}: {}", chatId, resp.description());
+        }
     }
 
     @Override
@@ -203,6 +251,15 @@ public class TelegramTransport implements TransportPlugin {
         }
         if (!text.isEmpty()) chunks.add(text);
         return chunks;
+    }
+
+    /**
+     * Parses the chatId string to the correct Telegram type.
+     * Groups/channels use a {@code long} (negative); private chats use {@code long} too.
+     * Passing a string works fine for {@link BotCommandsScopeChat} which accepts {@code Object}.
+     */
+    private static Object parseChatId(String chatId) {
+        try { return Long.parseLong(chatId); } catch (NumberFormatException e) { return chatId; }
     }
 
     private static String truncate(String s, int max) {

@@ -36,7 +36,7 @@ public class OnboardingFlow {
 
     /** Internal keys used to label answers in the generated profile. */
     private static final List<String> STEP_KEYS = List.of(
-            "topic", "level", "strengths", "weaknesses", "goal", "language", "tone", "detail"
+            "topic", "level", "strengths", "weaknesses", "goal", "language", "tone", "detail", "session_depth"
     );
 
     /** English question texts — used when no translation is provided. */
@@ -54,19 +54,24 @@ public class OnboardingFlow {
             "What tone do you prefer from the coach? " +
                     "(e.g. casual and friendly / formal and professional / direct and no-nonsense)",
             "How detailed should the answers be? " +
-                    "(e.g. brief and focused / thorough with examples and explanations)"
+                    "(e.g. brief and focused / thorough with examples and explanations)",
+            "How long should the coach work through a single topic with you? " +
+                    "(e.g. quick — 1-2 messages and move on / " +
+                    "standard — a few exchanges until you get it / " +
+                    "deep dive — keep going until the topic is fully covered)"
     );
 
     /** Human-readable labels used when building the profile text for the LLM. */
     private static final Map<String, String> KEY_LABELS = Map.of(
-            "topic",      "Topic / skill",
-            "level",      "Current level",
-            "strengths",  "Strengths",
-            "weaknesses", "Areas to improve",
-            "goal",       "Goal",
-            "language",   "Preferred language",
-            "tone",       "Communication tone",
-            "detail",     "Answer style"
+            "topic",         "Topic / skill",
+            "level",         "Current level",
+            "strengths",     "Strengths",
+            "weaknesses",    "Areas to improve",
+            "goal",          "Goal",
+            "language",      "Preferred language",
+            "tone",          "Communication tone",
+            "detail",        "Answer style",
+            "session_depth", "Session depth"
     );
 
     // ── Instance state ────────────────────────────────────────────────────────
@@ -169,7 +174,7 @@ public class OnboardingFlow {
         String profile = buildProfileText();
         String systemMessage = metaPromptTemplate.replace("{profile}", profile);
 
-        LlmRequest request = new LlmRequest(
+        LlmRequest request = LlmRequest.of(
                 systemMessage,
                 List.of(),
                 "Generate the coaching system prompt based on the profile above.",

@@ -10,6 +10,7 @@ import dev.coachbot.storage.StorageBackendRegistry;
 import dev.coachbot.translation.TranslationService;
 import dev.coachbot.transport.InboundMessage;
 import dev.coachbot.transport.TransportPlugin;
+import dev.coachbot.transport.TransportPlugin.CommandEntry;
 import dev.coachbot.transport.TransportRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -142,6 +143,9 @@ public class Orchestrator implements ApplicationRunner {
         log.info("Coach-bot ready. {} agents, {} transports.",
                 sessions.size(), transportRegistry.available().size());
 
+        // Register slash-command menus in transports that support it (e.g. Telegram)
+        syncCommandMenus(agents);
+
         // Block until shutdown (Ctrl+C / Docker stop)
         CountDownLatch shutdownLatch = new CountDownLatch(1);
         // addShutdownHook requires an UNSTARTED thread — use unstarted(), not start()
@@ -156,6 +160,27 @@ public class Orchestrator implements ApplicationRunner {
         shutdownLatch.await();
     }
 
+    // ── Direct dispatch (webchat) ──────────────────────────────────────────────
+
+    /**
+     * Routes a message directly to the named agent's session, bypassing the
+     * transport-binding lookup used by {@link #handleMessage}.
+     *
+     * <p>Used by {@link dev.coachbot.transport.webchat.WebChatController} which
+     * already knows the target agentId from the URL path — no DB lookup needed.
+     *
+     * @param agentId Target agent.
+     * @param msg     Inbound message (transportId should be {@code "webchat"}).
+     */
+    public void dispatch(String agentId, InboundMessage msg) {
+        GroupSession session = sessions.get(agentId);
+        if (session != null) {
+            session.enqueue(msg);
+        } else {
+            log.warn("[webchat] dispatch: no running session for agent '{}' — message dropped", agentId);
+        }
+    }
+
     // ── Hot-reload ─────────────────────────────────────────────────────────────
 
     /**
@@ -167,6 +192,9 @@ public class Orchestrator implements ApplicationRunner {
         GroupSession session = sessions.get(agentId);
         if (session != null) {
             session.reload();
+            // Keep transport command menus in sync after commands change
+            agentRepository.findById(agentId)
+                    .ifPresent(agent -> syncCommandMenus(List.of(agent)));
         } else {
             log.debug("reloadSession: no running session for agent '{}'", agentId);
         }
@@ -294,6 +322,62 @@ public class Orchestrator implements ApplicationRunner {
         log.error("Onboarding: no LLM backends are registered. " +
                 "Enable at least one (e.g. BOT_LLM_GEMINI_ENABLED=true).");
         return null;
+    }
+
+    // ── Command menus ──────────────────────────────────────────────────────────
+
+    /**
+     * Pushes each agent's enabled slash-commands to the native command menu of every
+     * transport binding that supports it (currently Telegram via {@code setMyCommands}).
+     *
+     * <p>When multiple agents share the same (transportId, chatId) binding their
+     * commands are merged — duplicates (same trigger) deduplicated, first-agent wins.
+     *
+     * <p>This is called once at startup and again after each hot-reload so the menu
+     * stays in sync with what's configured in the Admin UI.
+     */
+    private void syncCommandMenus(List<AgentConfig> agents) {
+        // Build: transportId → chatId → List<CommandEntry>
+        // (merge when multiple agents share a chat)
+        record ChatKey(String transportId, String chatId) {}
+        Map<ChatKey, List<CommandEntry>> menuMap = new java.util.LinkedHashMap<>();
+
+        for (AgentConfig agent : agents) {
+            List<CommandRepository.AgentCommand> cmds =
+                    commandRepository.findEnabledByAgent(agent.id());
+            if (cmds.isEmpty()) continue;
+
+            List<CommandEntry> entries = cmds.stream()
+                    .map(c -> new CommandEntry(c.trigger(), c.description()))
+                    .toList();
+
+            for (AgentRepository.TransportBinding binding : agentRepository.findTransports(agent.id())) {
+                ChatKey key = new ChatKey(binding.transportId(), binding.chatId());
+                menuMap.merge(key, entries, (existing, incoming) -> {
+                    // Merge: keep existing entries, append non-duplicate triggers from incoming
+                    var seen = existing.stream()
+                            .map(CommandEntry::trigger)
+                            .collect(java.util.stream.Collectors.toSet());
+                    var merged = new java.util.ArrayList<>(existing);
+                    incoming.stream()
+                            .filter(e -> !seen.contains(e.trigger()))
+                            .forEach(merged::add);
+                    return merged;
+                });
+            }
+        }
+
+        // Push to each transport
+        for (var entry : menuMap.entrySet()) {
+            transportRegistry.find(entry.getKey().transportId()).ifPresent(transport -> {
+                try {
+                    transport.registerCommands(entry.getKey().chatId(), entry.getValue());
+                } catch (Exception e) {
+                    log.warn("Failed to register commands for transport={} chatId={}: {}",
+                            entry.getKey().transportId(), entry.getKey().chatId(), e.getMessage());
+                }
+            });
+        }
     }
 
     private void validateBackends(List<AgentConfig> agents) {

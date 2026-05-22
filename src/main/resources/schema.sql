@@ -77,5 +77,6 @@ CREATE TABLE IF NOT EXISTS agent_schedules (
     created_at  TEXT,
     FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
 );
--- Migration: add save_path to databases created before this column existed
-ALTER TABLE agent_schedules ADD COLUMN IF NOT EXISTS save_path TEXT;
+-- Note: migrations for older databases are handled programmatically
+-- in SchemaMigration.java (see core package) to avoid SQLite version
+-- compatibility issues with ALTER TABLE ... IF NOT EXISTS (requires SQLite ≥ 3.37).

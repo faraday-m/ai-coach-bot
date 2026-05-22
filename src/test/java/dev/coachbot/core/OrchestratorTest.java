@@ -35,7 +35,7 @@ class OrchestratorIntegrationTest {
     static class EchoLlm implements LlmBackend {
         @Override public String id() { return "echo"; }
         @Override public LlmResponse complete(LlmRequest req) {
-            return new LlmResponse("Echo: " + req.userMessage());
+            return LlmResponse.text("Echo: " + req.userMessage());
         }
     }
 
@@ -44,7 +44,7 @@ class OrchestratorIntegrationTest {
         @Override public String id() { return "capture"; }
         @Override public LlmResponse complete(LlmRequest req) {
             this.lastRequest = req;
-            return new LlmResponse("OK");
+            return LlmResponse.text("OK");
         }
     }
 

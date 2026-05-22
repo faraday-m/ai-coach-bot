@@ -30,6 +30,22 @@ services:
     restart: unless-stopped
     stdin_open: false   # set to true to enable console transport inside Docker
 
+  # ── React chat frontend ─────────────────────────────────────────────────────
+  # Enable with: BOT_WEBCHAT_ENABLED=true  (also required in coach-bot env)
+  # Then open: http://localhost:3000
+  chat-frontend:
+    build:
+      context: ./frontend
+      args:
+        # Which agent the frontend talks to (must match an agent ID in the DB)
+        VITE_AGENT_ID: "${VITE_AGENT_ID:-default}"
+    profiles: [webchat]          # opt-in: docker compose --profile webchat up
+    ports:
+      - "${BOT_CHAT_PORT:-3000}:80"
+    depends_on:
+      - coach-bot
+    restart: unless-stopped
+
   # ── Bundled Ollama — only if you DON'T have Ollama installed on the host ────
   # If Ollama is already running on your machine, skip this profile entirely
   # and point BOT_LLM_OLLAMA_BASE_URL at http://host.docker.internal:11434

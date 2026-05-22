@@ -91,7 +91,7 @@ public class OpenAiBackend implements LlmBackend {
     @Override
     public LlmResponse complete(LlmRequest request) {
         Response<AiMessage> response = model.generate(buildMessages(request));
-        return new LlmResponse(response.content().text());
+        return LlmResponse.text(response.content().text());
     }
 
     private List<ChatMessage> buildMessages(LlmRequest request) {
@@ -101,8 +101,13 @@ public class OpenAiBackend implements LlmBackend {
         }
         for (ConversationMessage m : request.history()) {
             messages.add(switch (m.role()) {
-                case USER      -> UserMessage.from(m.content());
-                case ASSISTANT -> AiMessage.from(m.content());
+                case USER        -> UserMessage.from(m.content());
+                case ASSISTANT   -> AiMessage.from(m.content());
+                case TOOL_RESULT -> {
+                    // Tool result handling is not native on OpenAI backend — surface as user message.
+                    log.debug("[openai] TOOL_RESULT in history — injecting as user message");
+                    yield UserMessage.from(m.content());
+                }
             });
         }
         messages.add(UserMessage.from(request.userMessage()));
