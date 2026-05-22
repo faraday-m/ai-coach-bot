@@ -5,10 +5,17 @@ import dev.coachbot.llm.ConversationMessage;
 import dev.coachbot.llm.LlmBackend;
 import dev.coachbot.llm.LlmRequest;
 import dev.coachbot.llm.LlmResponse;
+import dev.coachbot.llm.Tool;
+import dev.coachbot.llm.ToolCall;
+import dev.coachbot.llm.ToolDefinition;
+import dev.coachbot.llm.ToolResult;
 import dev.coachbot.memory.MemoryService;
 import dev.coachbot.onboarding.OnboardingFlow;
 import dev.coachbot.storage.StorageBackend;
 import dev.coachbot.storage.StorageException;
+import dev.coachbot.tool.ListFilesTool;
+import dev.coachbot.tool.ReadFileTool;
+import dev.coachbot.tool.WriteFileTool;
 import dev.coachbot.translation.TranslationService;
 import dev.coachbot.transport.InboundMessage;
 import dev.coachbot.transport.TransportRegistry;
@@ -49,7 +56,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class GroupSession {
 
     private static final Logger log = LoggerFactory.getLogger(GroupSession.class);
-    private static final int MAX_HISTORY_TURNS = 20; // = 40 messages (user + assistant)
+    private static final int MAX_HISTORY_TURNS  = 20; // = 40 messages (user + assistant)
+    private static final int MAX_AGENT_STEPS    = 10; // safety cap for the agentic tool loop
     private static final String META_PROMPT_PATH      = "prompts/meta/generate-coach-prompt.md";
     private static final String WIKI_PROMPT_PATH      = "prompts/meta/wiki-summary.md";
     private static final String MEMORY_PROMPT_PATH    = "prompts/meta/memory-update.md";
@@ -576,20 +584,23 @@ public class GroupSession {
         List<ConversationMessage> historyForLlm =
                 isAgentCommand(text) ? List.of() : List.copyOf(history);
 
-        LlmRequest request = LlmRequest.of(
-                systemPrompt,
-                historyForLlm,
-                text,
-                canonicalId,
-                agentConfig.id()
-        );
-
         try {
             // Signal typing while LLM is running
             transportRegistry.find(msg.transportId())
                     .ifPresent(t -> t.sendTyping(msg.chatId()));
 
-            LlmResponse response = llmBackend.complete(request);
+            LlmResponse response;
+            if (llmBackend.supportsTools()) {
+                List<Tool> tools = buildAgentTools();
+                List<ToolDefinition> defs = tools.stream().map(Tool::definition).toList();
+                LlmRequest request = new LlmRequest(
+                        systemPrompt, historyForLlm, text, canonicalId, agentConfig.id(), defs);
+                response = runAgentLoop(request, tools);
+            } else {
+                LlmRequest request = LlmRequest.of(
+                        systemPrompt, historyForLlm, text, canonicalId, agentConfig.id());
+                response = llmBackend.complete(request);
+            }
 
             // Persist both messages before updating in-memory (crash-safe order)
             historyStore.append(agentConfig.id(), canonicalId, ConversationMessage.user(text));
@@ -713,5 +724,102 @@ public class GroupSession {
 
     private static String truncate(String s, int max) {
         return s.length() <= max ? s : s.substring(0, max) + "…";
+    }
+
+    // ── Agent loop (tool use) ─────────────────────────────────────────────────
+
+    /**
+     * Creates the standard set of storage tools available to the agent.
+     * These are plain objects — not Spring beans — constructed from the session's
+     * own {@link #storageBackend}.
+     */
+    private List<Tool> buildAgentTools() {
+        return List.of(
+                new WriteFileTool(storageBackend),
+                new ReadFileTool(storageBackend),
+                new ListFilesTool(storageBackend)
+        );
+    }
+
+    /**
+     * Runs the agentic tool-use loop for a single user request.
+     *
+     * <ol>
+     *   <li>Calls the LLM with the current request.</li>
+     *   <li>If the response contains tool calls, executes each one and appends
+     *       both the assistant turn and the tool results to the in-flight history.</li>
+     *   <li>Repeats until the LLM returns a text-only response or {@link #MAX_AGENT_STEPS}
+     *       is reached.</li>
+     * </ol>
+     *
+     * <p>The returned {@link LlmResponse} always contains a non-null {@code text}
+     * (the final reply to show the user).
+     *
+     * @param initial  The initial request (already contains tools in {@code request.tools()}).
+     * @param tools    The same tools, available for execution.
+     */
+    private LlmResponse runAgentLoop(LlmRequest initial, List<Tool> tools) {
+        List<ConversationMessage> history = new ArrayList<>(initial.history());
+        LlmRequest current = initial;
+
+        for (int step = 0; step < MAX_AGENT_STEPS; step++) {
+            LlmResponse resp = llmBackend.complete(current);
+
+            if (resp.toolCalls().isEmpty()) {
+                // Final text response — done
+                return resp;
+            }
+
+            log.info("[{}] Agent step {}: {} tool call(s): {}",
+                    agentConfig.id(), step + 1, resp.toolCalls().size(),
+                    resp.toolCalls().stream().map(ToolCall::toolName).toList());
+
+            // Persist assistant's tool-call decision into history
+            history.add(ConversationMessage.assistantToolCalls(resp.toolCalls(), resp.text()));
+
+            // Execute each tool and collect results
+            for (ToolCall tc : resp.toolCalls()) {
+                ToolResult tr = executeToolCall(tc, tools);
+                log.debug("[{}] Tool {} → {}", agentConfig.id(), tc.toolName(),
+                        tr.isError() ? "ERROR" : "ok");
+                history.add(ConversationMessage.toolResult(
+                        tr.toolCallId(), tr.toolName(), tr.resultJson()));
+            }
+
+            // Build next request with updated history (tools unchanged)
+            current = new LlmRequest(
+                    initial.systemPrompt(), List.copyOf(history),
+                    initial.userMessage(), initial.userId(), initial.agentId(),
+                    initial.tools());
+        }
+
+        log.warn("[{}] Agent loop reached MAX_AGENT_STEPS ({}) — returning step-cap message",
+                agentConfig.id(), MAX_AGENT_STEPS);
+        return LlmResponse.text(
+                "⚠️ The agent loop reached the maximum number of steps (" + MAX_AGENT_STEPS + ").");
+    }
+
+    /**
+     * Executes a single tool call by routing to the matching {@link Tool}.
+     * Never throws — errors are wrapped in the returned {@link ToolResult}.
+     */
+    private ToolResult executeToolCall(ToolCall tc, List<Tool> tools) {
+        return tools.stream()
+                .filter(t -> t.name().equals(tc.toolName()))
+                .findFirst()
+                .map(t -> {
+                    try {
+                        return t.execute(tc.toolCallId(), tc.argumentsJson());
+                    } catch (Exception e) {
+                        log.warn("[{}] Tool {} threw: {}", agentConfig.id(), tc.toolName(), e.getMessage());
+                        return new ToolResult(tc.toolCallId(), tc.toolName(),
+                                "{\"error\":\"" + e.getMessage() + "\"}", true);
+                    }
+                })
+                .orElseGet(() -> {
+                    log.warn("[{}] Unknown tool requested: {}", agentConfig.id(), tc.toolName());
+                    return new ToolResult(tc.toolCallId(), tc.toolName(),
+                            "{\"error\":\"unknown tool: " + tc.toolName() + "\"}", true);
+                });
     }
 }
