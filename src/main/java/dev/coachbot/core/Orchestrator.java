@@ -160,6 +160,27 @@ public class Orchestrator implements ApplicationRunner {
         shutdownLatch.await();
     }
 
+    // ── Direct dispatch (webchat) ──────────────────────────────────────────────
+
+    /**
+     * Routes a message directly to the named agent's session, bypassing the
+     * transport-binding lookup used by {@link #handleMessage}.
+     *
+     * <p>Used by {@link dev.coachbot.transport.webchat.WebChatController} which
+     * already knows the target agentId from the URL path — no DB lookup needed.
+     *
+     * @param agentId Target agent.
+     * @param msg     Inbound message (transportId should be {@code "webchat"}).
+     */
+    public void dispatch(String agentId, InboundMessage msg) {
+        GroupSession session = sessions.get(agentId);
+        if (session != null) {
+            session.enqueue(msg);
+        } else {
+            log.warn("[webchat] dispatch: no running session for agent '{}' — message dropped", agentId);
+        }
+    }
+
     // ── Hot-reload ─────────────────────────────────────────────────────────────
 
     /**

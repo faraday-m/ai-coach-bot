@@ -30,6 +30,13 @@ public class WebSecurityConfig extends VaadinWebSecurity {
 
     @Override
     protected void configure(HttpSecurity http) throws Exception {
+        // ── REST API — permit all; no CSRF (stateless JSON over SSE/fetch) ───────
+        // Must be declared BEFORE super.configure() which locks down everything else.
+        http.authorizeHttpRequests(auth -> auth
+                        .requestMatchers("/api/**").permitAll())
+                .csrf(csrf -> csrf.ignoringRequestMatchers("/api/**"));
+
+        // ── Vaadin admin UI — form login, session-based ──────────────────────────
         // Allow GET /logout so the logout button works without a form+CSRF token
         http.logout(logout -> logout
                 .logoutRequestMatcher(new AntPathRequestMatcher("/logout", "GET"))

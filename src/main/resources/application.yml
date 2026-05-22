@@ -51,6 +51,8 @@ bot:
     telegram:
       enabled: false
       token: "${TELEGRAM_BOT_TOKEN:}"
+    webchat:
+      enabled: "${BOT_WEBCHAT_ENABLED:false}"
     jabber:
       enabled: false
       # XMPP domain (e.g. jabber.org, your own server)

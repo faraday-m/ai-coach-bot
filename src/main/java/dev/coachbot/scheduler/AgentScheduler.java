@@ -40,6 +40,7 @@ import java.util.concurrent.TimeUnit;
  * Spring's {@link CronExpression} is used for parsing and next-fire calculation.
  */
 @Service
+@org.springframework.context.annotation.DependsOn("schemaMigration")
 public class AgentScheduler {
 
     private static final Logger log = LoggerFactory.getLogger(AgentScheduler.class);

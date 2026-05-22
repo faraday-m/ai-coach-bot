@@ -1,18 +1,22 @@
 # ai-coach-bot
 
-An extensible AI coaching bot for group chats. One image, multiple coaching agents (Java interview prep, English practice, system design, etc.), pluggable LLM backends and transports.
+An extensible AI coaching bot. One image, multiple coaching agents (Java interview prep, English practice, system design, etc.), pluggable LLM backends and transports.
 
 ```
-User (Telegram / Jabber / Console)
+User (Telegram / Jabber / Console / Web chat)
         │
         ▼
   Orchestrator  ──  trigger "@Andy" ──▶  GroupSession [java-coach]
                                                │
-                                    ┌──────────┼──────────┐
-                                  LLM      History     Storage
-                               (Claude /   (SQLite)  (Markdown /
-                               Gemini /              Obsidian)
-                               OpenAI …)
+                                  ┌────────────┼────────────┐
+                               LLM          History      Storage
+                           (Claude /        (SQLite)   (Markdown /
+                           Gemini /                     Obsidian)
+                           OpenAI …)
+                               │
+                    ┌──────────┴──────────┐
+                 Agent Loop           Memory
+               (tool calls)      (per-user .md)
 ```
 
 ---
@@ -21,7 +25,7 @@ User (Telegram / Jabber / Console)
 
 - **Docker** and **Docker Compose** — that's it.
 
-No Java, no Maven, no local toolchain needed to run the bot.  
+No Java, no Node, no local toolchain needed to run the bot.  
 _(Java 21 + Maven are only required if you want to [build from source](#building-from-source).)_
 
 ---
@@ -90,11 +94,42 @@ BOT_TRANSPORTS_TELEGRAM_ENABLED=true
 BOT_TRANSPORTS_CONSOLE_ENABLED=false
 ```
 
+The bot automatically registers available slash-commands in the Telegram command menu for each chat it is connected to — users see `/wiki`, `/memory`, `/onboard` and any custom commands added via the admin UI.
+
 #### 2c. Start
 
 ```bash
 docker compose up -d
 docker compose logs -f coach-bot
+```
+
+---
+
+## Web Chat Frontend
+
+A lightweight React chat UI is available as an optional Docker profile. It connects to the bot over SSE (Server-Sent Events) and requires no extra infrastructure.
+
+```bash
+# Enable and start
+BOT_WEBCHAT_ENABLED=true docker compose --profile webchat up -d
+```
+
+Open **http://localhost:3000** — the chat loads immediately.
+
+| Env var | Default | Description |
+|---|---|---|
+| `BOT_WEBCHAT_ENABLED` | `false` | Enable the REST + SSE backend |
+| `BOT_CHAT_PORT` | `3000` | Host port for the React frontend |
+| `VITE_AGENT_ID` | `default` | Which agent the UI talks to (must be a valid agent ID in the DB) |
+
+The UI includes a **command picker**: type `/` to browse all available commands (system + agent-specific). Session state is stored in `localStorage` — history survives page refresh.
+
+For local development without Docker:
+
+```bash
+cd frontend
+npm install
+npm run dev   # → http://localhost:5173, proxies /api to :8080
 ```
 
 ---
@@ -120,23 +155,7 @@ Configuring agent: default (My Coach)
 [2/8] What is your current level in this area?
 > 5 years Java, strong on collections and JVM internals
 
-[3/8] What are your strengths?
-> Distributed systems, JVM tuning
-
-[4/8] What areas feel hardest or most important to improve?
-> System Design vocabulary, concurrency edge cases
-
-[5/8] What is your goal?
-> Pass a Staff Engineer interview at a FAANG
-
-[6/8] What language should the coach use?
-> Russian
-
-[7/8] What tone do you prefer from the coach?
-> Casual and friendly
-
-[8/8] How detailed should the answers be?
-> Thorough with examples and explanations
+...
 
 ─── Generated system prompt ─────────────────────────
 You are an expert Java and system design coach...
@@ -195,6 +214,120 @@ All changes take effect immediately — no restart required.
 
 ---
 
+## Built-in commands
+
+These commands are available in every agent regardless of configuration:
+
+| Command | Description |
+|---|---|
+| `/wiki <path>` | Summarise the conversation since the last `/wiki` and save to storage |
+| `/wiki <path> <instruction>` | Same, but follow a custom directive |
+| `/memory` | Show the current learning memory for this user |
+| `/memory add <text>` | Append a note directly (no LLM call) |
+| `/memory reset` | Delete the memory file for this user |
+| `/onboard` | Restart the onboarding questionnaire |
+
+Agent-specific commands (e.g. `/quiz`, `/hint`) are defined per-agent in the Admin UI → Commands tab and show up alongside system commands in the Telegram menu and web chat command picker.
+
+---
+
+## Knowledge capture — `/wiki`
+
+At any point in a conversation you can ask the bot to distil what was covered into a Markdown note and save it to the agent's storage backend (filesystem or Obsidian vault).
+
+```
+/wiki notes/virtual-threads
+```
+
+The LLM reads the conversation **since your last `/wiki` call** and produces a structured note. The checkpoint advances after each save — the next `/wiki` captures only the new part of the conversation.
+
+### With an instruction
+
+```
+/wiki notes/gc  Напиши подробную статью про сборщик мусора в Java
+```
+
+### Multiple files (agentic mode)
+
+```
+/wiki notes/  Сохрани GC и virtual threads как отдельные статьи
+```
+
+Bot reply:
+```
+✅ Saved: `notes/gc-algorithms.md`, `notes/virtual-threads.md`
+```
+
+---
+
+## Agent Memory
+
+After each `/wiki` save the bot automatically builds a **learning memory** document for the user — a concise Markdown file that tracks topic progress, session statistics, observed preferences, and coach notes.
+
+The memory is injected into every LLM request as hidden context, so the bot remembers where you left off without you having to repeat yourself.
+
+```
+/memory               — show the current memory document
+/memory add <text>    — append a note directly (no LLM call)
+/memory reset         — clear all memory for this agent
+```
+
+Memory files are stored in the agent's storage backend at `coach-bot/memory/<agentId>/<userId>.md`.
+
+---
+
+## Tool Use (Claude backend)
+
+When using the Claude backend the bot operates as an **agent loop**: it can call tools to read, write, and list files before returning a final answer.
+
+```
+You: What topics are in my notes/?
+Bot: [calls list_files("notes/")] → [calls read_file("notes/virtual-threads.md")] → answers
+```
+
+Available tools:
+
+| Tool | What it does |
+|---|---|
+| `read_file` | Read a file from the agent's storage backend |
+| `write_file` | Write or overwrite a file |
+| `list_files` | List files under a path prefix |
+
+The loop runs for up to 10 steps, then returns whatever it has. Other LLM backends (Gemini, OpenAI, Ollama) do not use the agent loop — they receive a single `complete()` call.
+
+---
+
+## Scheduled broadcasts
+
+```bash
+docker compose run --rm coach-bot --mode=manage
+```
+
+```
+> schedule list default
+> schedule add default "0 9 * * MON-FRI" Give me a morning Java question
+> schedule enable 1  /  schedule disable 1  /  schedule rm 1
+```
+
+Cron format — standard 5-field Unix cron: `minute hour day month weekday`
+
+```
+"0 9 * * MON-FRI"   — weekdays at 09:00
+"30 18 * * *"        — every day at 18:30
+```
+
+### Auto-save to storage
+
+Set a **Save to path** to automatically persist the LLM response after each broadcast:
+
+```
+> schedule add default "0 20 * * *" "Summarise what I should review tomorrow" journal/{date}
+```
+
+The `{date}` placeholder is replaced with the current date (`YYYY-MM-DD`). The response is **appended** with a timestamp heading — multiple firings per day accumulate in the same file.
+
+---
+
 ## Configuration
 
 Configuration is layered — **later sources override earlier ones**:
@@ -208,10 +341,11 @@ Configuration is layered — **later sources override earlier ones**:
 Any `application.yml` property can be overridden via env var: replace `.` with `_`, uppercase everything.
 
 ```
-bot.llm.claude.enabled           →  BOT_LLM_CLAUDE_ENABLED
-bot.llm.gemini.model             →  BOT_LLM_GEMINI_MODEL
-bot.transports.telegram.enabled  →  BOT_TRANSPORTS_TELEGRAM_ENABLED
-bot.language                     →  BOT_LANGUAGE
+bot.llm.claude.enabled              →  BOT_LLM_CLAUDE_ENABLED
+bot.llm.gemini.model                →  BOT_LLM_GEMINI_MODEL
+bot.transports.telegram.enabled     →  BOT_TRANSPORTS_TELEGRAM_ENABLED
+bot.transports.webchat.enabled      →  BOT_WEBCHAT_ENABLED
+bot.language                        →  BOT_LANGUAGE
 ```
 
 ### LLM backends
@@ -220,7 +354,7 @@ All backends are **disabled by default**.
 
 | Backend | Key env var | Notes |
 |---|---|---|
-| `claude` | `ANTHROPIC_API_KEY` | Official API key (`sk-ant-api03-…`) |
+| `claude` | `ANTHROPIC_API_KEY` | Official API key (`sk-ant-api03-…`). Supports tool use and streaming. |
 | `gemini` | `GEMINI_API_KEY` | Free at [aistudio.google.com](https://aistudio.google.com/app/apikey) |
 | `openai` | `OPENAI_API_KEY` | Also works with Groq, OpenRouter, LM Studio via `BOT_LLM_OPENAI_BASE_URL` |
 | `ollama` | *(none)* | Local models — set `BOT_LLM_OLLAMA_BASE_URL` (default: `http://host.docker.internal:11434`) |
@@ -230,14 +364,15 @@ All backends are **disabled by default**.
 | Transport | Key env var | Notes |
 |---|---|---|
 | `console` | — | Stdin/stdout — enabled by default for local testing |
-| `telegram` | `TELEGRAM_BOT_TOKEN` | Enable with `BOT_TRANSPORTS_TELEGRAM_ENABLED=true` |
-| `jabber` | `BOT_JABBER_USERNAME`, `BOT_JABBER_PASSWORD` | XMPP — enable with `BOT_TRANSPORTS_JABBER_ENABLED=true` |
+| `telegram` | `TELEGRAM_BOT_TOKEN` | Enable with `BOT_TRANSPORTS_TELEGRAM_ENABLED=true`. Registers command menus per chat. |
+| `jabber` | `BOT_JABBER_USERNAME` | XMPP — enable with `BOT_TRANSPORTS_JABBER_ENABLED=true` |
+| `webchat` | — | SSE-based REST transport for the React frontend. Enable with `BOT_WEBCHAT_ENABLED=true`. |
 
 Jabber config:
 
 ```bash
 BOT_TRANSPORTS_JABBER_ENABLED=true
-BOT_JABBER_SERVER=jabber.org          # XMPP domain
+BOT_JABBER_SERVER=jabber.org
 BOT_JABBER_HOST=                      # optional: direct IP if DNS doesn't resolve SRV
 BOT_JABBER_PORT=5222
 BOT_JABBER_USERNAME=bot@jabber.org
@@ -255,14 +390,11 @@ BOT_JABBER_ACCEPT_ALL_CERTS=false     # true only for self-signed local servers
 **Enable Obsidian storage:**
 
 ```bash
-# .env — host path for the Docker volume mount
 BOT_STORAGE_OBSIDIAN_ENABLED=true
 OBSIDIAN_VAULT_PATH=/Users/you/Documents/MyVault
 ```
 
-The `docker-compose.yml` mounts `$OBSIDIAN_VAULT_PATH` to `/obsidian` inside the container. Spring reads from `/obsidian` by default — no extra config needed.
-
-Notes are written to a `coach-bot/` subfolder inside the vault. Override:
+The `docker-compose.yml` mounts `$OBSIDIAN_VAULT_PATH` to `/obsidian` inside the container. Notes are written to a `coach-bot/` subfolder inside the vault. Override:
 
 ```yaml
 # config/application.yml
@@ -273,8 +405,6 @@ bot:
 ```
 
 ### Initial agent name
-
-The first-run seed uses `BOT_AGENT_NAME` for the default agent's display name:
 
 ```bash
 BOT_AGENT_NAME="Java Interview Coach"   # default: "Java Coach"
@@ -303,7 +433,7 @@ docker compose run --rm coach-bot --mode=manage
 ```
 > agent list
 > agent show default
-> agent edit default          # edit system prompt ($EDITOR or inline)
+> agent edit default
 > agent create
 > agent add-transport default telegram -1001234567890
 > agent rm-transport  default telegram -1001234567890
@@ -318,104 +448,6 @@ docker compose run --rm coach-bot --mode=manage
 
 > help
 > exit
-```
-
-Cron format — standard 5-field Unix cron: `minute hour day month weekday`
-
-```
-"0 9 * * MON-FRI"   — weekdays at 09:00
-"30 18 * * *"        — every day at 18:30
-"* 19 * * *"         — every minute of 19:xx (use quotes — cron contains spaces)
-```
-
-> Wrap multi-word cron expressions in quotes: `schedule add default "* 19 * * *" Tell a joke`
-
-### Scheduled auto-save to storage
-
-Set a **Save to path** on a schedule to automatically persist the LLM-generated response to storage after each broadcast:
-
-```
-> schedule add default "0 20 * * *" "Summarise what I should review tomorrow" journal/{date}
-```
-
-The `{date}` placeholder is replaced with the current date (`YYYY-MM-DD`) in the bot's timezone, so each day's entry goes into a separate file.
-The response is **appended** with a timestamp heading — multiple firings per day accumulate in the same file.
-
-You can also set the save path in the Admin UI → Schedules tab.
-
-**Tip:** set `EDITOR=nano` (or `vim`) to edit prompts in your preferred editor:
-
-```bash
-docker compose run --rm -e EDITOR=nano coach-bot --mode=manage
-```
-
----
-
-## Knowledge capture — `/wiki`
-
-At any point in a conversation you can ask the bot to distil what was covered into a Markdown note and save it to the agent's storage backend (filesystem or Obsidian vault).
-
-### Basic usage
-
-```
-/wiki notes/virtual-threads
-```
-
-The LLM reads the conversation **since your last `/wiki` call** (not the entire history) and produces a structured note:
-
-```markdown
-# Virtual Threads in Java 21
-
-## Summary
-Discussion of Project Loom's virtual threads…
-
-## Key concepts
-- Virtual threads are cheap — millions can exist simultaneously
-- Mounted/unmounted from carrier threads at blocking points
-…
-
-## Solutions / Approaches
-…
-
-## Takeaways
-- Prefer virtual threads for IO-bound tasks
-- Don't pool virtual threads
-…
-```
-
-The checkpoint advances after each save, so the next `/wiki` captures only the new part of the conversation — handy for long sessions or daily journals.
-
-### With an instruction
-
-Pass a directive after the path to guide what gets generated:
-
-```
-/wiki notes/gc  Напиши подробную статью про сборщик мусора в Java, не просто суммаризацию
-```
-
-The instruction overrides the default summary structure — the LLM can write a full article, add extra context, or focus on a specific subtopic.
-
-### Multiple files (agentic mode)
-
-The LLM can create several files in one call when the conversation spans distinct topics:
-
-```
-/wiki notes/  Сохрани GC и virtual threads как отдельные статьи
-```
-
-Bot reply:
-```
-✅ Saved: `notes/gc-algorithms.md`, `notes/virtual-threads.md`
-```
-
-Under the hood the LLM uses `<wiki_file path="...">...</wiki_file>` blocks; the bot parses and saves each one. If the model doesn't follow the format, the full response is saved to the given path (fallback).
-
-### Verbatim save
-
-Provide content explicitly to skip the LLM entirely:
-
-```
-/wiki notes/standup Shipped scheduler hot-reload, fixed gitignore comment bug
 ```
 
 ---
@@ -511,23 +543,31 @@ bot:
 src/main/java/dev/coachbot/
 ├── cli/            ManageCli              — --mode=manage interactive console
 ├── config/         SeedProperties         — YAML → SQLite seed on first run
-├── core/           Orchestrator           — message routing
+├── core/           Orchestrator           — message routing + webchat dispatch
 │                   GroupSession           — per-agent conversation loop + commands
+│                   SchemaMigration        — programmatic SQLite column migrations
 │                   AgentRepository        — SQLite CRUD for agents
 │                   CommandRepository      — SQLite CRUD for slash-commands
 │                   MessageRepository      — conversation history (SQLite)
 │                   UserIdentityRepository — cross-transport identity mapping
 ├── credentials/    env / vault / onecli   — pluggable credential providers
-├── llm/            claude / gemini / openai / ollama
+├── llm/            LlmBackend / LlmRequest / LlmResponse / ConversationMessage
+│                   Tool / ToolDefinition / ToolCall / ToolResult  — tool-use SPI
+│                   claude / gemini / openai / ollama
+├── memory/         MemoryService          — per-user learning memory (async update)
 ├── onboarding/     OnboardingFlow         — 8-step FSM → LLM-generated system prompt
 │                   OnboardWizard          — --mode=onboard CLI
 ├── scheduler/      AgentScheduler         — cron-based broadcast messages
 │                   ScheduleRepository     — SQLite CRUD for schedules
 ├── storage/        filesystem / obsidian
+├── tool/           WriteFileTool / ReadFileTool / ListFilesTool
 ├── translation/    MyMemoryClient         — MyMemory free translation API
 │                   TranslationService     — translate + cache + English fallback
 ├── transport/      console / telegram / jabber
+│                   webchat/               — SSE transport + REST controller
 └── web/            Vaadin admin UI (AgentsView, AgentDetailView, …)
+
+frontend/                                  — React web chat (Vite + TypeScript + Tailwind)
 ```
 
 New LLM backend: implement `LlmBackend`, annotate `@Component`.  
@@ -553,6 +593,14 @@ java -jar target/coach-bot.jar
 
 java -jar target/coach-bot.jar --mode=manage
 java -jar target/coach-bot.jar --mode=onboard
+```
+
+Frontend (local dev):
+
+```bash
+cd frontend
+npm install
+npm run dev   # Vite dev server at :5173, proxies /api to :8080
 ```
 
 ---
