@@ -5,6 +5,7 @@ import dev.coachbot.llm.ConversationMessage;
 import dev.coachbot.llm.LlmBackend;
 import dev.coachbot.llm.LlmRequest;
 import dev.coachbot.llm.LlmResponse;
+import dev.coachbot.memory.MemoryService;
 import dev.coachbot.onboarding.OnboardingFlow;
 import dev.coachbot.storage.StorageBackend;
 import dev.coachbot.storage.StorageException;
@@ -51,6 +52,7 @@ public class GroupSession {
     private static final int MAX_HISTORY_TURNS = 20; // = 40 messages (user + assistant)
     private static final String META_PROMPT_PATH      = "prompts/meta/generate-coach-prompt.md";
     private static final String WIKI_PROMPT_PATH      = "prompts/meta/wiki-summary.md";
+    private static final String MEMORY_PROMPT_PATH    = "prompts/meta/memory-update.md";
 
     private volatile AgentConfig agentConfig;
     private final LlmBackend llmBackend;
@@ -65,6 +67,11 @@ public class GroupSession {
     private volatile String metaPromptTemplate;
     /** Lazily loaded meta-prompt template for /wiki summarisation. */
     private volatile String wikiPromptTemplate;
+    /** Lazily loaded meta-prompt template for memory updates. */
+    private volatile String memoryPromptTemplate;
+
+    /** Manages the persistent per-user learning-memory document. Initialised lazily. */
+    private volatile MemoryService memoryService;
     /** Commands for this agent, loaded once at session start. */
     private volatile List<AgentCommand> commands = List.of();
 
@@ -194,6 +201,12 @@ public class GroupSession {
             return;
         }
 
+        // ── /memory — view / update / reset learning memory ──────────────────
+        if (text.startsWith("/memory")) {
+            handleMemory(msg, canonicalId, text.substring(7).trim());
+            return;
+        }
+
         // ── /wiki — save to storage ───────────────────────────────────────────
         if (text.startsWith("/wiki")) {
             handleWiki(msg, canonicalId, text.substring(5).trim());
@@ -243,6 +256,60 @@ public class GroupSession {
             sb.append("\n");
         }
         reply(msg, sb.toString());
+    }
+
+    // ── /memory ───────────────────────────────────────────────────────────────
+
+    /**
+     * Handles the {@code /memory} family of commands:
+     * <ul>
+     *   <li>{@code /memory} — show the current memory document</li>
+     *   <li>{@code /memory add <text>} — append a note directly (no LLM)</li>
+     *   <li>{@code /memory reset} — delete the memory file</li>
+     * </ul>
+     */
+    private void handleMemory(InboundMessage msg, String canonicalId, String args) {
+        if (args.isBlank()) {
+            // Show current memory
+            memoryService().load(agentConfig.id(), canonicalId).ifPresentOrElse(
+                    memory -> reply(msg, memory),
+                    () -> reply(msg, "ℹ️ No memory yet. Use /wiki to save notes — memory builds automatically.")
+            );
+            return;
+        }
+
+        if (args.equalsIgnoreCase("reset")) {
+            try {
+                memoryService().reset(agentConfig.id(), canonicalId);
+                reply(msg, "✅ Memory cleared.");
+            } catch (UnsupportedOperationException e) {
+                reply(msg, "⚠️ Storage backend does not support delete — cannot reset memory.");
+            } catch (Exception e) {
+                reply(msg, "⚠️ Could not reset memory: " + e.getMessage());
+            }
+            return;
+        }
+
+        if (args.startsWith("add ") || args.startsWith("add\n")) {
+            String note = args.substring(4).trim();
+            if (note.isBlank()) {
+                reply(msg, "Usage: /memory add <your note>");
+                return;
+            }
+            try {
+                memoryService().appendNote(agentConfig.id(), canonicalId, note);
+                reply(msg, "✅ Note added to memory.");
+            } catch (Exception e) {
+                reply(msg, "⚠️ Could not save note: " + e.getMessage());
+            }
+            return;
+        }
+
+        reply(msg, """
+                Usage:
+                • `/memory` — show current memory
+                • `/memory add <text>` — add a coach note
+                • `/memory reset` — clear memory""");
     }
 
     // ── /wiki ──────────────────────────────────────────────────────────────────
@@ -334,6 +401,13 @@ public class GroupSession {
             // Update checkpoint so next /wiki only processes new material
             wikiCheckpoints.put(canonicalId, history.size());
 
+            // Fire-and-forget memory update for each saved file
+            for (WikiFile wf : files) {
+                if (saved.stream().anyMatch(s -> s.contains(wf.path()))) {
+                    memoryService().updateAsync(agentConfig.id(), canonicalId, wf.content());
+                }
+            }
+
             // Report back
             var sb = new StringBuilder();
             if (!saved.isEmpty())  sb.append("✅ Saved: ").append(String.join(", ", saved));
@@ -369,7 +443,7 @@ public class GroupSession {
             userMessage.append("\n\nUser instructions: ").append(instruction);
         }
 
-        LlmRequest request = new LlmRequest(wikiPrompt, List.of(), userMessage.toString(), "wiki", agentConfig.id());
+        LlmRequest request = LlmRequest.of(wikiPrompt, List.of(), userMessage.toString(), "wiki", agentConfig.id());
         return llmBackend.complete(request).text();
     }
 
@@ -493,7 +567,8 @@ public class GroupSession {
                 id -> historyStore.load(agentConfig.id(), id, MAX_HISTORY_TURNS * 2));
 
         String systemPrompt = buildEffectiveSystemPrompt(
-                userSystemPromptOverrides.getOrDefault(canonicalId, agentConfig.systemPrompt()));
+                userSystemPromptOverrides.getOrDefault(canonicalId, agentConfig.systemPrompt()),
+                canonicalId);
 
         // Commands are stateless by design: send empty history so the LLM responds
         // fresh from the system prompt + command description only.
@@ -501,7 +576,7 @@ public class GroupSession {
         List<ConversationMessage> historyForLlm =
                 isAgentCommand(text) ? List.of() : List.copyOf(history);
 
-        LlmRequest request = new LlmRequest(
+        LlmRequest request = LlmRequest.of(
                 systemPrompt,
                 historyForLlm,
                 text,
@@ -544,18 +619,27 @@ public class GroupSession {
     // ── System prompt assembly ─────────────────────────────────────────────────
 
     /**
-     * Returns the base system prompt with an optional commands section appended.
-     * The commands section tells the LLM what to do when the user sends a slash-command.
+     * Returns the effective system prompt: base + slash-command descriptions + learning memory.
+     *
+     * <p>The memory section is appended last so it appears closest to the conversation,
+     * which helps models with recency bias pick it up reliably.
      */
-    private String buildEffectiveSystemPrompt(String base) {
-        if (commands.isEmpty()) return base;
+    private String buildEffectiveSystemPrompt(String base, String canonUserId) {
         StringBuilder sb = new StringBuilder(base.stripTrailing());
-        sb.append("\n\n## Available commands\n");
-        sb.append("When the user sends one of these commands, treat it as a self-contained request: ");
-        sb.append("ignore the previous conversation history and respond based solely on the command description and your expertise.\n");
-        for (AgentCommand cmd : commands) {
-            sb.append("- `").append(cmd.trigger()).append("` — ").append(cmd.description()).append("\n");
+
+        if (!commands.isEmpty()) {
+            sb.append("\n\n## Available commands\n");
+            sb.append("When the user sends one of these commands, treat it as a self-contained request: ");
+            sb.append("ignore the previous conversation history and respond based solely on the command description and your expertise.\n");
+            for (AgentCommand cmd : commands) {
+                sb.append("- `").append(cmd.trigger()).append("` — ").append(cmd.description()).append("\n");
+            }
         }
+
+        // Inject learning memory when available — gives the LLM context about the learner
+        memoryService().load(agentConfig.id(), canonUserId).ifPresent(memory ->
+                sb.append("\n\n---\n## Your memory of this learner\n").append(memory.stripTrailing()));
+
         return sb.toString();
     }
 
@@ -602,6 +686,29 @@ public class GroupSession {
         } catch (IOException e) {
             throw new IllegalStateException("Cannot load wiki meta-prompt from classpath: " + WIKI_PROMPT_PATH, e);
         }
+    }
+
+    private String loadMemoryPrompt() {
+        if (memoryPromptTemplate != null) return memoryPromptTemplate;
+        try {
+            var resource = new ClassPathResource(MEMORY_PROMPT_PATH);
+            memoryPromptTemplate = resource.getContentAsString(StandardCharsets.UTF_8);
+            return memoryPromptTemplate;
+        } catch (IOException e) {
+            throw new IllegalStateException("Cannot load memory meta-prompt from classpath: " + MEMORY_PROMPT_PATH, e);
+        }
+    }
+
+    /** Lazily initialises MemoryService on first use (prompt loaded from classpath). */
+    private MemoryService memoryService() {
+        if (memoryService == null) {
+            synchronized (this) {
+                if (memoryService == null) {
+                    memoryService = new MemoryService(storageBackend, llmBackend, loadMemoryPrompt());
+                }
+            }
+        }
+        return memoryService;
     }
 
     private static String truncate(String s, int max) {

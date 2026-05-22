@@ -180,7 +180,7 @@ public class AgentScheduler {
         log.info("Schedule #{} firing: agent='{}' prompt='{}'",
                 schedule.id(), agent.id(), truncate(schedule.prompt(), 80));
 
-        LlmRequest request = new LlmRequest(
+        LlmRequest request = LlmRequest.of(
                 agent.systemPrompt(), List.of(), schedule.prompt(), "scheduler", agent.id());
         String response;
         try {

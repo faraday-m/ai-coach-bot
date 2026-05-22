@@ -169,7 +169,7 @@ public class OnboardingFlow {
         String profile = buildProfileText();
         String systemMessage = metaPromptTemplate.replace("{profile}", profile);
 
-        LlmRequest request = new LlmRequest(
+        LlmRequest request = LlmRequest.of(
                 systemMessage,
                 List.of(),
                 "Generate the coaching system prompt based on the profile above.",
