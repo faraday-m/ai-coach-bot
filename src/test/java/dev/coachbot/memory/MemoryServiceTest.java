@@ -50,11 +50,13 @@ class MemoryServiceTest {
     private CaptureLlm llm;
     private MemoryService service;
 
+    private static final String BOOTSTRAP_PROMPT = "You are a bootstrap assistant.";
+
     @BeforeEach
     void setUp() {
         storage = new MapStorage();
         llm     = new CaptureLlm();
-        service = new MemoryService(storage, llm, "You are a memory assistant.");
+        service = new MemoryService(storage, llm, "You are a memory assistant.", BOOTSTRAP_PROMPT);
     }
 
     // ── load ───────────────────────────────────────────────────────────────────
@@ -165,5 +167,70 @@ class MemoryServiceTest {
     void reset_noopsWhenFileAbsent() {
         // Should not throw
         service.reset("agent1", "user:abc");
+    }
+
+    // ── bootstrapAsync ─────────────────────────────────────────────────────────
+
+    @Test
+    void bootstrapAsync_writesGeneratedMemory() throws InterruptedException {
+        llm.fixedResponse = "## Learning Plan\n- [ ] Kafka\n## Topic Statistics\n| Topic | Sessions | Last seen | Level |\n|---|---|---|---|\n| Kafka | 0 | — | ⬇️ Needs work |";
+
+        service.bootstrapAsync("agent1", "user:abc", "You are a Kafka coach.", "/quiz — Start a quiz");
+        Thread.sleep(500);
+
+        String path = service.memoryPath("agent1", "user:abc");
+        assertThat(storage.store).containsKey(path);
+        assertThat(storage.store.get(path)).contains("Kafka");
+    }
+
+    @Test
+    void bootstrapAsync_includesSystemPromptAndCommandsInRequest() throws InterruptedException {
+        service.bootstrapAsync("agent1", "user:abc", "You are a Kafka coach.", "/quiz — Start a quiz\n/hint — Get a hint");
+        Thread.sleep(500);
+
+        assertThat(llm.received).hasSize(1);
+        String userMsg = llm.received.get(0).userMessage();
+        assertThat(userMsg).contains("You are a Kafka coach.");
+        assertThat(userMsg).contains("/quiz — Start a quiz");
+        assertThat(userMsg).contains("/hint — Get a hint");
+    }
+
+    @Test
+    void bootstrapAsync_skipsWhenMemoryAlreadyExists() throws InterruptedException {
+        // Pre-populate memory — bootstrap should not overwrite it
+        String path = service.memoryPath("agent1", "user:abc");
+        storage.store.put(path, "## Existing memory");
+
+        service.bootstrapAsync("agent1", "user:abc", "You are a coach.", "");
+        Thread.sleep(500);
+
+        // LLM must not have been called
+        assertThat(llm.received).isEmpty();
+        // Existing memory must be untouched
+        assertThat(storage.store.get(path)).isEqualTo("## Existing memory");
+    }
+
+    @Test
+    void bootstrapAsync_skipsWhenNoBootstrapPromptConfigured() throws InterruptedException {
+        MemoryService noBootstrap = new MemoryService(storage, llm, "update prompt");  // no bootstrap template
+
+        noBootstrap.bootstrapAsync("agent1", "user:abc", "You are a coach.", "");
+        Thread.sleep(300);
+
+        assertThat(llm.received).isEmpty();
+        assertThat(storage.store).doesNotContainKey(noBootstrap.memoryPath("agent1", "user:abc"));
+    }
+
+    @Test
+    void bootstrapAsync_worksWithoutCommandsText() throws InterruptedException {
+        service.bootstrapAsync("agent1", "user:abc", "You are a Java coach.", "");
+        Thread.sleep(500);
+
+        String path = service.memoryPath("agent1", "user:abc");
+        assertThat(llm.received).hasSize(1);
+        String userMsg = llm.received.get(0).userMessage();
+        assertThat(userMsg).contains("You are a Java coach.");
+        assertThat(userMsg).doesNotContain("Available commands:");
+        assertThat(storage.store).containsKey(path);
     }
 }

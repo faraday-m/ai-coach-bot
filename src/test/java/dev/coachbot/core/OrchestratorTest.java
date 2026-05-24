@@ -43,7 +43,11 @@ class OrchestratorIntegrationTest {
         volatile LlmRequest lastRequest;
         @Override public String id() { return "capture"; }
         @Override public LlmResponse complete(LlmRequest req) {
-            this.lastRequest = req;
+            // Ignore background bootstrap calls (userId="bootstrap") — they run on a virtual
+            // thread and would otherwise race with test assertions on lastRequest.
+            if (!"bootstrap".equals(req.userId())) {
+                this.lastRequest = req;
+            }
             return LlmResponse.text("OK");
         }
     }

@@ -61,6 +61,7 @@ public class GroupSession {
     private static final String META_PROMPT_PATH      = "prompts/meta/generate-coach-prompt.md";
     private static final String WIKI_PROMPT_PATH      = "prompts/meta/wiki-summary.md";
     private static final String MEMORY_PROMPT_PATH    = "prompts/meta/memory-update.md";
+    private static final String MEMORY_BOOTSTRAP_PATH = "prompts/meta/memory-bootstrap.md";
     private static final String COMMANDS_PROMPT_PATH  = "prompts/meta/generate-commands.md";
 
     private volatile AgentConfig agentConfig;
@@ -78,6 +79,8 @@ public class GroupSession {
     private volatile String wikiPromptTemplate;
     /** Lazily loaded meta-prompt template for memory updates. */
     private volatile String memoryPromptTemplate;
+    /** Lazily loaded meta-prompt template for initial memory bootstrap (null until first use). */
+    private volatile String memoryBootstrapTemplate;
     /** Lazily loaded meta-prompt template for post-onboarding command generation. */
     private volatile String commandsPromptTemplate;
 
@@ -177,6 +180,11 @@ public class GroupSession {
                 truncate(msg.text(), 120));
 
         String text = msg.text().trim();
+
+        // Trigger async memory bootstrap on every message — fires at most once while
+        // no memory exists (MemoryService.bootstrapAsync guards with bootstrapTriggered).
+        // Placed here so it runs regardless of message type (/memory, /wiki, LLM, etc.).
+        triggerMemoryBootstrap(canonicalId);
 
         // ── /cancel — abort any active flow ───────────────────────────────────
         if (text.equalsIgnoreCase("/cancel")) {
@@ -662,6 +670,28 @@ public class GroupSession {
         }
     }
 
+    // ── Memory bootstrap ───────────────────────────────────────────────────────
+
+    /**
+     * Fires an async memory bootstrap for this user if they don't have a memory document yet.
+     *
+     * <p>Safe to call on every message — {@link MemoryService#bootstrapAsync} uses an internal
+     * {@code bootstrapTriggered} set to ensure at most one background LLM call is in-flight at
+     * a time per user. After the call completes the key is removed, so bootstrap can retrigger
+     * if the user later resets their memory with {@code /memory reset}.
+     *
+     * <p>The check is intentionally placed in {@link #processMessage} (not just
+     * {@link #handleLlmMessage}) so it fires on any first interaction — including
+     * {@code /memory}, {@code /progress}, etc. — not just regular chat messages.
+     */
+    private void triggerMemoryBootstrap(String canonicalId) {
+        String commandsText = commands.stream()
+                .map(c -> c.trigger() + " — " + c.description())
+                .collect(java.util.stream.Collectors.joining("\n"));
+        memoryService().bootstrapAsync(
+                agentConfig.id(), canonicalId, agentConfig.systemPrompt(), commandsText);
+    }
+
     // ── System prompt assembly ─────────────────────────────────────────────────
 
     /**
@@ -806,16 +836,37 @@ public class GroupSession {
         }
     }
 
-    /** Lazily initialises MemoryService on first use (prompt loaded from classpath). */
+    /** Lazily initialises MemoryService on first use (prompts loaded from classpath). */
     private MemoryService memoryService() {
         if (memoryService == null) {
             synchronized (this) {
                 if (memoryService == null) {
-                    memoryService = new MemoryService(storageBackend, llmBackend, loadMemoryPrompt());
+                    memoryService = new MemoryService(storageBackend, llmBackend,
+                            loadMemoryPrompt(), loadMemoryBootstrapPrompt());
                 }
             }
         }
         return memoryService;
+    }
+
+    /**
+     * Lazy loader for the memory-bootstrap meta-prompt.
+     * Returns {@code null} when the resource is unavailable — {@link MemoryService}
+     * treats {@code null} as "bootstrap disabled" and skips it silently.
+     */
+    private String loadMemoryBootstrapPrompt() {
+        if (memoryBootstrapTemplate != null) return memoryBootstrapTemplate;
+        synchronized (this) {
+            if (memoryBootstrapTemplate != null) return memoryBootstrapTemplate;
+            try {
+                memoryBootstrapTemplate = new org.springframework.core.io.ClassPathResource(MEMORY_BOOTSTRAP_PATH)
+                        .getContentAsString(java.nio.charset.StandardCharsets.UTF_8);
+            } catch (java.io.IOException e) {
+                log.warn("[{}] Cannot load memory-bootstrap prompt — bootstrap will be skipped", agentConfig.id());
+                memoryBootstrapTemplate = "";  // "" = "failed, don't retry"; MemoryService.bootstrapAsync() checks isBlank()
+            }
+            return memoryBootstrapTemplate;
+        }
     }
 
     private static String truncate(String s, int max) {

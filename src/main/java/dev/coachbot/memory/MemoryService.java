@@ -38,11 +38,31 @@ public class MemoryService {
     private final LlmBackend llm;
     /** Loaded once from classpath: prompts/meta/memory-update.md */
     private final String promptTemplate;
+    /**
+     * Loaded once from classpath: prompts/meta/memory-bootstrap.md
+     * May be {@code null} if the classpath resource is unavailable — bootstrap is then skipped.
+     */
+    private final String bootstrapPromptTemplate;
 
+    /**
+     * Full constructor — used in production.
+     *
+     * @param bootstrapPromptTemplate may be {@code null}; bootstrap is silently skipped when null
+     */
+    public MemoryService(StorageBackend storage, LlmBackend llm,
+                         String promptTemplate, String bootstrapPromptTemplate) {
+        this.storage                 = storage;
+        this.llm                     = llm;
+        this.promptTemplate          = promptTemplate;
+        this.bootstrapPromptTemplate = bootstrapPromptTemplate;
+    }
+
+    /**
+     * Backwards-compatible 3-arg constructor (no bootstrap support).
+     * Used by tests that don't need bootstrap behaviour.
+     */
     public MemoryService(StorageBackend storage, LlmBackend llm, String promptTemplate) {
-        this.storage        = storage;
-        this.llm            = llm;
-        this.promptTemplate = promptTemplate;
+        this(storage, llm, promptTemplate, null);
     }
 
     // ── Public API ─────────────────────────────────────────────────────────────
@@ -75,6 +95,90 @@ public class MemoryService {
                       log.warn("[memory] Async update failed for {}/{}", agentId, canonUserId, e);
                   }
               });
+    }
+
+    /**
+     * Fires a background LLM call that generates an <em>initial</em> memory document for a
+     * user who has no memory yet.
+     *
+     * <p>The bootstrap prompt asks the LLM to derive key learning topics from the agent's
+     * system prompt and its slash-command list.  The result is written to storage so that
+     * the next message the user sends already has memory injected into the system prompt.
+     *
+     * <p>This method is a no-op (logs a debug line) when:
+     * <ul>
+     *   <li>the bootstrap prompt template was not provided at construction time, or</li>
+     *   <li>a memory file already exists and is non-blank (race-condition guard).</li>
+     * </ul>
+     *
+     * @param agentSystemPrompt the agent's master system prompt — describes the coaching domain
+     * @param commandsText      pre-formatted command list (e.g. {@code "/quiz — Start a quiz\n/hint — Get a hint"});
+     *                          pass an empty string if the agent has no commands
+     */
+    /**
+     * Tracks (agentId + "/" + safeFilename) pairs where bootstrap has already been triggered
+     * in this session — ensures we fire at most once per user per JVM lifetime, even if
+     * {@code bootstrapAsync()} is called from the message path on every message while storage
+     * hasn't written yet.
+     */
+    private final java.util.Set<String> bootstrapTriggered =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    public void bootstrapAsync(String agentId, String canonUserId,
+                               String agentSystemPrompt, String commandsText) {
+        if (bootstrapPromptTemplate == null || bootstrapPromptTemplate.isBlank()) {
+            log.debug("[memory] Bootstrap skipped for {}/{} — no bootstrap prompt available", agentId, canonUserId);
+            return;
+        }
+        String key = agentId + "/" + safeFilename(canonUserId);
+        if (!bootstrapTriggered.add(key)) {
+            log.debug("[memory] Bootstrap already triggered for {}/{} — skipping duplicate", agentId, canonUserId);
+            return;
+        }
+        Thread.ofVirtual()
+              .name("memory-bootstrap-" + agentId + "-" + safeFilename(canonUserId))
+              .start(() -> {
+                  try {
+                      doBootstrap(agentId, canonUserId, agentSystemPrompt, commandsText);
+                  } catch (Exception e) {
+                      log.warn("[memory] Async bootstrap failed for {}/{}", agentId, canonUserId, e);
+                  } finally {
+                      // Remove so the next message can retrigger if memory was reset/deleted
+                      bootstrapTriggered.remove(key);
+                  }
+              });
+    }
+
+    private void doBootstrap(String agentId, String canonUserId,
+                             String agentSystemPrompt, String commandsText) throws StorageException {
+        String path = memoryPath(agentId, canonUserId);
+        // Re-check under the virtual thread — another message may have triggered bootstrap
+        // concurrently and already written the file.
+        Optional<String> existing = storage.read(path);
+        if (existing.isPresent() && !existing.get().isBlank()) {
+            log.debug("[memory] Bootstrap skipped for {}/{} — memory already present", agentId, canonUserId);
+            return;
+        }
+
+        log.info("[memory] No memory for {}/{} — bootstrapping initial topics (LLM call in progress…)",
+                agentId, canonUserId);
+
+        StringBuilder input = new StringBuilder("Agent system prompt:\n").append(agentSystemPrompt);
+        if (commandsText != null && !commandsText.isBlank()) {
+            input.append("\n\nAvailable commands:\n").append(commandsText);
+        }
+
+        LlmRequest request = LlmRequest.of(
+                bootstrapPromptTemplate, List.of(), input.toString(), "bootstrap", agentId);
+        String content = llm.complete(request).text();
+
+        if (content == null || content.isBlank()) {
+            log.warn("[memory] Bootstrap LLM returned empty content for {}/{} — skipping", agentId, canonUserId);
+            return;
+        }
+
+        storage.write(path, content);
+        log.info("[memory] Bootstrapped initial memory for {}/{} ({} chars)", agentId, canonUserId, content.length());
     }
 
     /**

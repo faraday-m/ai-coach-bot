@@ -372,16 +372,28 @@ Set `schedule_type = 'spaced_review'` to turn a cron schedule into a personalise
 | ➡️ Familiar | After 5–7 days |
 | ⬆️ Confident | After 14–21 days |
 
-If a topic is due, the bot sends a short personalised message with an opening question. If nothing is due today, it stays silent — no spam.
+If a topic is due, the bot sends a short personalised message with an opening question and closes with **"When we're done, I'll give you a quick summary of today's session."** The bot stays focused on that one topic for the whole conversation and does not suggest switching. If nothing is due today it stays silent — no spam.
 
-Insert a spaced-review schedule directly in the database (no CLI support yet — the Vaadin UI shows it as a regular schedule):
+Topics with **Last seen = "—"** (never reviewed) are always treated as immediately due and shown at the highest priority.
+
+Insert a spaced-review schedule directly in the database (or create it via the **Schedules** tab in the Vaadin admin UI with `schedule_type = spaced_review`):
 
 ```sql
 INSERT INTO agent_schedules (agent_id, cron, prompt, schedule_type, enabled)
 VALUES ('java-coach', '0 9 * * *', '', 'spaced_review', 1);
 ```
 
-The `prompt` field is ignored for `spaced_review` schedules — the built-in `spaced-review.md` meta-prompt is always used. Memory is populated automatically after each `/wiki` save.
+The `prompt` field is ignored for `spaced_review` schedules — the built-in `spaced-review.md` meta-prompt is always used.
+
+#### Memory bootstrap
+
+When a user has no memory file yet (first-time or after `/memory reset`), the spaced-review scheduler **automatically bootstraps** an initial memory document before sending the first review:
+
+1. It reads the agent's enabled commands (`/quiz`, `/hint`, …) and system prompt.
+2. Calls the LLM with the `memory-bootstrap.md` meta-prompt to generate an initial `## Topic Statistics` table (all topics start with `Sessions = 0`, `Last seen = —`, `⬇️ Needs work`).
+3. Saves the document to the agent's storage backend and immediately proceeds with the normal SR review.
+
+This means users receive a meaningful first review message the very first time the cron fires — no manual `/wiki` needed to seed the memory.
 
 ---
 

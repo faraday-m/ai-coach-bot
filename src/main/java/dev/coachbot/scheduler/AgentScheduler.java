@@ -2,6 +2,7 @@ package dev.coachbot.scheduler;
 
 import dev.coachbot.core.AgentConfig;
 import dev.coachbot.core.AgentRepository;
+import dev.coachbot.core.CommandRepository;
 import dev.coachbot.core.UserIdentityStore;
 import dev.coachbot.llm.LlmBackend;
 import dev.coachbot.llm.LlmBackendRegistry;
@@ -48,10 +49,12 @@ import java.util.concurrent.TimeUnit;
 public class AgentScheduler {
 
     private static final Logger log = LoggerFactory.getLogger(AgentScheduler.class);
-    private static final String SR_PROMPT_PATH = "prompts/meta/spaced-review.md";
+    private static final String SR_PROMPT_PATH        = "prompts/meta/spaced-review.md";
+    private static final String BOOTSTRAP_PROMPT_PATH = "prompts/meta/memory-bootstrap.md";
 
     private final ScheduleRepository scheduleRepo;
     private final AgentRepository agentRepo;
+    private final CommandRepository commandRepo;
     private final UserIdentityStore identityStore;
     private final LlmBackendRegistry llmRegistry;
     private final TransportRegistry transportRegistry;
@@ -60,6 +63,8 @@ public class AgentScheduler {
 
     /** Lazily loaded spaced-review meta-prompt template. */
     private volatile String srPromptTemplate;
+    /** Lazily loaded memory-bootstrap meta-prompt template. */
+    private volatile String bootstrapPromptTemplate;
 
     private final ScheduledExecutorService executor =
             Executors.newScheduledThreadPool(4, Thread.ofVirtual().factory());
@@ -69,6 +74,7 @@ public class AgentScheduler {
 
     public AgentScheduler(ScheduleRepository scheduleRepo,
                           AgentRepository agentRepo,
+                          CommandRepository commandRepo,
                           UserIdentityStore identityStore,
                           LlmBackendRegistry llmRegistry,
                           TransportRegistry transportRegistry,
@@ -76,6 +82,7 @@ public class AgentScheduler {
                           @org.springframework.beans.factory.annotation.Value("${bot.timezone:UTC}") String timezone) {
         this.scheduleRepo      = scheduleRepo;
         this.agentRepo         = agentRepo;
+        this.commandRepo       = commandRepo;
         this.identityStore     = identityStore;
         this.llmRegistry       = llmRegistry;
         this.transportRegistry = transportRegistry;
@@ -88,12 +95,57 @@ public class AgentScheduler {
         List<ScheduleRepository.AgentSchedule> schedules = scheduleRepo.findAllEnabled();
         if (schedules.isEmpty()) {
             log.info("No active schedules found.");
-            return;
+        } else {
+            for (ScheduleRepository.AgentSchedule s : schedules) {
+                register(s);
+            }
+            log.info("Registered {} agent schedule(s).", schedules.size());
         }
-        for (ScheduleRepository.AgentSchedule s : schedules) {
-            register(s);
+
+        // Bootstrap memory at startup for any user who doesn't have it yet.
+        // Runs in the background so it doesn't block Spring context startup.
+        List<ScheduleRepository.AgentSchedule> srSchedules = schedules.stream()
+                .filter(s -> "spaced_review".equals(s.scheduleType()))
+                .toList();
+        if (!srSchedules.isEmpty()) {
+            executor.execute(() -> bootstrapExistingUsers(srSchedules));
         }
-        log.info("Registered {} agent schedule(s).", schedules.size());
+    }
+
+    /**
+     * Scans all users known to agents that have a {@code spaced_review} schedule and
+     * bootstraps a memory document for any user who doesn't have one yet.
+     *
+     * <p>Called once at startup from {@link #registerAll()} — runs in a background thread
+     * so the bot is fully ready to handle messages while bootstrapping proceeds.
+     */
+    private void bootstrapExistingUsers(List<ScheduleRepository.AgentSchedule> srSchedules) {
+        for (ScheduleRepository.AgentSchedule schedule : srSchedules) {
+            Optional<AgentConfig> agentOpt = agentRepo.findById(schedule.agentId());
+            if (agentOpt.isEmpty() || !agentOpt.get().enabled()) continue;
+            AgentConfig agent = agentOpt.get();
+            if (!llmRegistry.has(agent.llmBackendId())) continue;
+            LlmBackend llm = llmRegistry.get(agent.llmBackendId());
+            Optional<StorageBackend> storageOpt = storageRegistry.find(agent.storageBackendId());
+            if (storageOpt.isEmpty()) continue;
+            StorageBackend storage = storageOpt.get();
+
+            List<String> users = agentRepo.findUsersByAgent(agent.id());
+            for (String canonUserId : users) {
+                try {
+                    String path = memoryPath(agent.id(), canonUserId);
+                    Optional<String> existing = storage.read(path);
+                    if (existing.isEmpty()) {
+                        log.info("Startup bootstrap: user '{}' / agent '{}' has no memory — bootstrapping.",
+                                canonUserId, agent.id());
+                        bootstrapMemory(schedule, agent, llm, storage, path);
+                    }
+                } catch (Exception e) {
+                    log.warn("Startup bootstrap failed for user '{}' / agent '{}'.",
+                            canonUserId, agent.id(), e);
+                }
+            }
+        }
     }
 
     @PreDestroy
@@ -327,7 +379,7 @@ public class AgentScheduler {
                                StorageBackend storage,
                                String srPrompt,
                                String canonUserId) {
-        String memoryPath = "coach-bot/memory/" + agent.id() + "/" + safeFilename(canonUserId) + ".md";
+        String memoryPath = memoryPath(agent.id(), canonUserId);
         Optional<String> memoryOpt;
         try {
             memoryOpt = storage.read(memoryPath);
@@ -336,10 +388,17 @@ public class AgentScheduler {
                     schedule.id(), canonUserId, e);
             return;
         }
+
         if (memoryOpt.isEmpty()) {
-            log.debug("SR schedule #{}: no memory for user '{}' — skipping.",
+            log.info("SR schedule #{}: no memory for user '{}' — bootstrapping initial topics.",
                     schedule.id(), canonUserId);
-            return;
+            String bootstrapped = bootstrapMemory(schedule, agent, llm, storage, memoryPath);
+            if (bootstrapped == null) {
+                log.debug("SR schedule #{}: bootstrap produced nothing for user '{}' — skipping.",
+                        schedule.id(), canonUserId);
+                return;
+            }
+            memoryOpt = Optional.of(bootstrapped);
         }
 
         String response = llm.complete(
@@ -378,6 +437,78 @@ public class AgentScheduler {
         }
     }
 
+    /**
+     * Generates an initial memory document for a user who has no memory file yet.
+     *
+     * <p>Builds a user message from the agent's system prompt and its enabled commands,
+     * then calls the LLM with the bootstrap meta-prompt to synthesise an initial Topic
+     * Statistics table.  The result is written to storage and returned so the caller can
+     * immediately proceed to the SR review without a second storage read.
+     *
+     * @return the bootstrapped memory document, or {@code null} if generation failed
+     */
+    private String bootstrapMemory(ScheduleRepository.AgentSchedule schedule,
+                                   AgentConfig agent,
+                                   LlmBackend llm,
+                                   StorageBackend storage,
+                                   String memoryPath) {
+        // Build description: system prompt + optional command list
+        List<CommandRepository.AgentCommand> commands;
+        try {
+            commands = commandRepo.findEnabledByAgent(agent.id());
+        } catch (Exception e) {
+            log.warn("Bootstrap #{}: could not load commands for agent '{}' — using system prompt only.",
+                    schedule.id(), agent.id(), e);
+            commands = List.of();
+        }
+
+        StringBuilder input = new StringBuilder("Agent system prompt:\n").append(agent.systemPrompt());
+        if (!commands.isEmpty()) {
+            input.append("\n\nAvailable commands:\n");
+            for (CommandRepository.AgentCommand cmd : commands) {
+                input.append(cmd.trigger()).append(" — ").append(cmd.description()).append("\n");
+            }
+        }
+
+        String bootstrapPrompt;
+        try {
+            bootstrapPrompt = loadBootstrapPrompt();
+        } catch (Exception e) {
+            log.error("Bootstrap #{}: cannot load bootstrap prompt from classpath.", schedule.id(), e);
+            return null;
+        }
+
+        String memoryContent;
+        try {
+            memoryContent = llm.complete(
+                    LlmRequest.of(bootstrapPrompt, List.of(), input.toString(), "scheduler", agent.id())
+            ).text();
+        } catch (Exception e) {
+            log.warn("Bootstrap #{}: LLM call failed.", schedule.id(), e);
+            return null;
+        }
+
+        if (memoryContent == null || memoryContent.isBlank()) {
+            log.warn("Bootstrap #{}: LLM returned empty content — skipping.", schedule.id());
+            return null;
+        }
+
+        try {
+            storage.write(memoryPath, memoryContent);
+            log.info("Bootstrap #{}: memory initialised at '{}'.", schedule.id(), memoryPath);
+        } catch (Exception e) {
+            // Log but don't fail — user still gets their first review
+            log.warn("Bootstrap #{}: could not persist memory to '{}' — review will still fire.",
+                    schedule.id(), memoryPath, e);
+        }
+        return memoryContent;
+    }
+
+    /** Returns the canonical storage path for a user's memory document. */
+    private String memoryPath(String agentId, String canonUserId) {
+        return "coach-bot/memory/" + agentId + "/" + safeFilename(canonUserId) + ".md";
+    }
+
     /** Lazy loader for the spaced-review meta-prompt template. */
     private String loadSrPrompt() {
         if (srPromptTemplate != null) return srPromptTemplate;
@@ -388,6 +519,19 @@ public class AgentScheduler {
         } catch (IOException e) {
             throw new IllegalStateException(
                     "Cannot load spaced-review meta-prompt from classpath: " + SR_PROMPT_PATH, e);
+        }
+    }
+
+    /** Lazy loader for the memory-bootstrap meta-prompt template. */
+    private String loadBootstrapPrompt() {
+        if (bootstrapPromptTemplate != null) return bootstrapPromptTemplate;
+        try {
+            var resource = new ClassPathResource(BOOTSTRAP_PROMPT_PATH);
+            bootstrapPromptTemplate = resource.getContentAsString(StandardCharsets.UTF_8);
+            return bootstrapPromptTemplate;
+        } catch (IOException e) {
+            throw new IllegalStateException(
+                    "Cannot load memory-bootstrap meta-prompt from classpath: " + BOOTSTRAP_PROMPT_PATH, e);
         }
     }
 
