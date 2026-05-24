@@ -35,6 +35,12 @@ public class SchemaMigration {
         addColumnIfAbsent(
                 "agent_schedules", "schedule_type",
                 "ALTER TABLE agent_schedules ADD COLUMN schedule_type TEXT NOT NULL DEFAULT 'broadcast'");
+        addColumnIfAbsent(
+                "messages", "transport_id",
+                "ALTER TABLE messages ADD COLUMN transport_id TEXT");
+        addColumnIfAbsent(
+                "messages", "trigger_type",
+                "ALTER TABLE messages ADD COLUMN trigger_type TEXT");
     }
 
     /**

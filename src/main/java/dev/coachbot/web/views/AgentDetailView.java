@@ -5,6 +5,7 @@ import com.vaadin.flow.component.UI;
 import com.vaadin.flow.component.button.Button;
 import com.vaadin.flow.component.button.ButtonVariant;
 import com.vaadin.flow.component.checkbox.Checkbox;
+import com.vaadin.flow.component.checkbox.CheckboxGroup;
 import com.vaadin.flow.component.dialog.Dialog;
 import com.vaadin.flow.component.formlayout.FormLayout;
 import com.vaadin.flow.component.grid.Grid;
@@ -22,6 +23,15 @@ import com.vaadin.flow.component.tabs.TabSheet;
 import com.vaadin.flow.component.select.Select;
 import com.vaadin.flow.component.textfield.TextArea;
 import com.vaadin.flow.component.textfield.TextField;
+import com.vaadin.flow.component.progressbar.ProgressBar;
+import com.vaadin.flow.component.timepicker.TimePicker;
+import com.vaadin.flow.data.provider.DataProvider;
+
+import java.time.LocalTime;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 import com.vaadin.flow.router.BeforeEnterEvent;
 import com.vaadin.flow.router.BeforeEnterObserver;
 import com.vaadin.flow.router.PageTitle;
@@ -31,10 +41,16 @@ import dev.coachbot.core.AgentRepository;
 import dev.coachbot.core.AgentRepository.TransportBinding;
 import dev.coachbot.core.CommandRepository;
 import dev.coachbot.core.CommandRepository.AgentCommand;
+import dev.coachbot.core.MessageRepository;
+import dev.coachbot.core.MessageRepository.MessageRow;
 import dev.coachbot.core.Orchestrator;
+import dev.coachbot.memory.MemoryProgressParser;
+import dev.coachbot.memory.MemoryProgressParser.TopicProgress;
 import dev.coachbot.scheduler.AgentScheduler;
 import dev.coachbot.scheduler.ScheduleRepository;
 import dev.coachbot.scheduler.ScheduleRepository.AgentSchedule;
+import dev.coachbot.storage.StorageBackend;
+import dev.coachbot.storage.StorageBackendRegistry;
 import jakarta.annotation.security.PermitAll;
 
 @Route(value = "agent/:agentId", layout = MainLayout.class)
@@ -49,6 +65,8 @@ public class AgentDetailView extends VerticalLayout implements BeforeEnterObserv
     private final ScheduleRepository scheduleRepo;
     private final Orchestrator orchestrator;
     private final AgentScheduler agentScheduler;
+    private final MessageRepository messageRepo;
+    private final StorageBackendRegistry storageRegistry;
 
     private AgentConfig agent;
 
@@ -56,12 +74,16 @@ public class AgentDetailView extends VerticalLayout implements BeforeEnterObserv
                            CommandRepository commandRepo,
                            ScheduleRepository scheduleRepo,
                            Orchestrator orchestrator,
-                           AgentScheduler agentScheduler) {
-        this.agentRepo      = agentRepo;
-        this.commandRepo    = commandRepo;
-        this.scheduleRepo   = scheduleRepo;
-        this.orchestrator   = orchestrator;
-        this.agentScheduler = agentScheduler;
+                           AgentScheduler agentScheduler,
+                           MessageRepository messageRepo,
+                           StorageBackendRegistry storageRegistry) {
+        this.agentRepo        = agentRepo;
+        this.commandRepo      = commandRepo;
+        this.scheduleRepo     = scheduleRepo;
+        this.orchestrator     = orchestrator;
+        this.agentScheduler   = agentScheduler;
+        this.messageRepo      = messageRepo;
+        this.storageRegistry  = storageRegistry;
         setSizeFull();
         setPadding(true);
     }
@@ -91,6 +113,8 @@ public class AgentDetailView extends VerticalLayout implements BeforeEnterObserv
         tabs.add("Commands",      commandsTab());
         tabs.add("Transports",    transportsTab());
         tabs.add("Schedules",     schedulesTab());
+        tabs.add("Messages",      messagesTab());
+        tabs.add("Progress",      progressTab());
 
         add(back, title, tabs);
         expand(tabs);
@@ -487,9 +511,11 @@ public class AgentDetailView extends VerticalLayout implements BeforeEnterObserv
         addRow.setWidthFull();
         addRow.expand(promptField);
 
+        var builderSection = buildCronBuilderSection(cronField);
+
         var layout = new VerticalLayout(
                 new H3("Scheduled Messages"), grid,
-                new Hr(), new Paragraph("Add schedule:"), addRow);
+                new Hr(), new Paragraph("Add schedule:"), builderSection, addRow);
         layout.setPadding(false);
         return layout;
     }
@@ -497,12 +523,16 @@ public class AgentDetailView extends VerticalLayout implements BeforeEnterObserv
     private void openEditScheduleDialog(AgentSchedule schedule, Grid<AgentSchedule> grid) {
         var dialog = new Dialog();
         dialog.setHeaderTitle("Edit Schedule");
-        dialog.setWidth("500px");
+        dialog.setWidth("560px");
 
         var cronField = new TextField("Cron expression");
         cronField.setValue(schedule.cron());
         cronField.setHelperText("5 fields: minute hour day month weekday");
         cronField.setWidthFull();
+
+        // Cron builder pre-populates from the existing cron expression if it matches
+        // the simple "min hour * * days" pattern; otherwise falls back to defaults.
+        var builderSection = buildCronBuilderSection(cronField);
 
         var typeSelect = new Select<String>();
         typeSelect.setLabel("Type");
@@ -536,7 +566,7 @@ public class AgentDetailView extends VerticalLayout implements BeforeEnterObserv
             if (isSr) promptField.clear();
         });
 
-        var content = new VerticalLayout(cronField, typeSelect, promptField, savePathField);
+        var content = new VerticalLayout(builderSection, cronField, typeSelect, promptField, savePathField);
         content.setPadding(false);
         dialog.add(content);
 
@@ -563,6 +593,328 @@ public class AgentDetailView extends VerticalLayout implements BeforeEnterObserv
         save.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
         dialog.getFooter().add(cancel, save);
         dialog.open();
+    }
+
+    // ── Messages ──────────────────────────────────────────────────────────────
+
+    private Component messagesTab() {
+        // ── Filters ───────────────────────────────────────────────────────────
+        var transportFilter = new Select<String>();
+        transportFilter.setLabel("Transport");
+        transportFilter.setItems("All", "telegram", "webchat", "console");
+        transportFilter.setValue("All");
+        transportFilter.setWidth("150px");
+
+        var triggerFilter = new Select<String>();
+        triggerFilter.setLabel("Trigger");
+        triggerFilter.setItems("All", "user_message", "user_command");
+        triggerFilter.setValue("All");
+        triggerFilter.setWidth("160px");
+
+        var loadBtn = new Button("Load");
+        loadBtn.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+
+        var filterRow = new HorizontalLayout(transportFilter, triggerFilter, loadBtn);
+        filterRow.setAlignItems(FlexComponent.Alignment.END);
+
+        // ── Grid ──────────────────────────────────────────────────────────────
+        var grid = new Grid<MessageRow>(MessageRow.class, false);
+
+        // ID column — click to open full-detail dialog
+        grid.addComponentColumn(row -> {
+            var btn = new Button(String.valueOf(row.id()));
+            btn.addThemeVariants(ButtonVariant.LUMO_TERTIARY, ButtonVariant.LUMO_SMALL);
+            btn.addClickListener(e -> openMessageDialog(row));
+            return btn;
+        }).setHeader("ID").setWidth("80px").setFlexGrow(0).setResizable(true);
+
+        grid.addColumn(MessageRow::createdAt).setHeader("Created").setWidth("190px").setFlexGrow(0).setResizable(true);
+        grid.addColumn(MessageRow::userId).setHeader("User").setWidth("140px").setFlexGrow(0).setResizable(true);
+        grid.addColumn(MessageRow::role).setHeader("Role").setWidth("80px").setFlexGrow(0).setResizable(true);
+        grid.addColumn(MessageRow::transportId).setHeader("Transport").setWidth("110px").setFlexGrow(0).setResizable(true);
+        grid.addColumn(MessageRow::triggerType).setHeader("Trigger").setWidth("130px").setFlexGrow(0).setResizable(true);
+        grid.addColumn(row -> {
+            String c = row.content();
+            return c != null && c.length() > 120 ? c.substring(0, 120) + "…" : c;
+        }).setHeader("Content (click ID for full text)").setFlexGrow(1).setResizable(true);
+        grid.setColumnReorderingAllowed(true);
+        grid.setPageSize(25);
+        grid.setSizeFull();
+
+        loadBtn.addClickListener(e -> {
+            String transport = "All".equals(transportFilter.getValue()) ? null : transportFilter.getValue();
+            String trigger   = "All".equals(triggerFilter.getValue())   ? null : triggerFilter.getValue();
+            // Lazy DataProvider: fetches 25 rows at a time as the user scrolls.
+            // The count query tells the grid when to stop requesting more data.
+            grid.setDataProvider(DataProvider.fromCallbacks(
+                    query -> messageRepo.findMessages(
+                            agent.id(), transport, trigger,
+                            query.getOffset(), query.getLimit()).stream(),
+                    query -> messageRepo.countMessages(agent.id(), transport, trigger)
+            ));
+        });
+
+        var layout = new VerticalLayout(filterRow, grid);
+        layout.setSizeFull();
+        layout.setPadding(false);
+        layout.expand(grid);
+        return layout;
+    }
+
+    /** Opens a read-only dialog showing the full content of a message row. */
+    private void openMessageDialog(MessageRow row) {
+        var dialog = new Dialog();
+        dialog.setHeaderTitle("Message #" + row.id());
+        dialog.setWidth("640px");
+        dialog.setMaxHeight("80vh");
+
+        var form = new FormLayout();
+        form.setResponsiveSteps(new FormLayout.ResponsiveStep("0", 2));
+        form.addFormItem(field(row.createdAt()),                       "Created");
+        form.addFormItem(field(row.userId()),                         "User");
+        form.addFormItem(field(row.role()),                           "Role");
+        form.addFormItem(field(row.transportId()),                    "Transport");
+        form.addFormItem(field(row.triggerType()),                    "Trigger");
+
+        var content = new TextArea("Content");
+        content.setValue(row.content() != null ? row.content() : "");
+        content.setWidthFull();
+        content.setMinHeight("200px");
+        content.setReadOnly(true);
+
+        var close = new Button("Close", e -> dialog.close());
+        close.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+        dialog.getFooter().add(close);
+
+        var body = new VerticalLayout(form, content);
+        body.setPadding(false);
+        dialog.add(body);
+        dialog.open();
+    }
+
+
+    // ── Progress ──────────────────────────────────────────────────────────────
+
+    /**
+     * Shows per-topic learning progress for a selected canonical user.
+     * Reads their memory document from the agent's storage backend and
+     * parses the {@code ## Topic Statistics} table.
+     */
+    private Component progressTab() {
+        // ── User selector ─────────────────────────────────────────────────────
+        List<String> users = agentRepo.findUsersByAgent(agent.id());
+
+        var userSelect = new Select<String>();
+        userSelect.setLabel("User");
+        userSelect.setItems(users);
+        userSelect.setPlaceholder(users.isEmpty() ? "No users yet" : "Select user…");
+        userSelect.setEnabled(!users.isEmpty());
+        userSelect.setWidth("300px");
+
+        var loadBtn = new Button("Load Progress");
+        loadBtn.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+        loadBtn.setEnabled(!users.isEmpty());
+
+        var filterRow = new HorizontalLayout(userSelect, loadBtn);
+        filterRow.setAlignItems(FlexComponent.Alignment.END);
+
+        // ── Status label (shown when no data) ─────────────────────────────────
+        var statusLabel = new Paragraph();
+        statusLabel.setVisible(false);
+        statusLabel.getStyle().set("color", "var(--lumo-secondary-text-color)");
+
+        // ── Progress grid ─────────────────────────────────────────────────────
+        var grid = new Grid<TopicProgress>(TopicProgress.class, false);
+        grid.addColumn(t -> t.emoji() + "  " + t.topic())
+                .setHeader("Topic").setFlexGrow(1);
+        grid.addColumn(TopicProgress::sessions)
+                .setHeader("Sessions").setWidth("110px").setFlexGrow(0);
+        grid.addColumn(TopicProgress::lastSeen)
+                .setHeader("Last seen").setWidth("130px").setFlexGrow(0);
+        grid.addColumn(TopicProgress::level)
+                .setHeader("Level").setWidth("170px").setFlexGrow(0);
+        grid.addComponentColumn(t -> {
+            var bar = new ProgressBar(0.0, 1.0, t.fraction());
+            bar.setWidth("160px");
+            // Colour the bar: green for Confident, yellow for Familiar, red for Needs work
+            String colour = t.fraction() >= 1.0 ? "var(--lumo-success-color)"
+                          : t.fraction() >= 0.5 ? "var(--lumo-warning-color)"
+                          : "var(--lumo-error-color)";
+            bar.getStyle().set("--lumo-primary-color", colour);
+            return bar;
+        }).setHeader("Progress").setWidth("180px").setFlexGrow(0);
+        grid.setAllRowsVisible(true);
+
+        loadBtn.addClickListener(e -> {
+            String canonUser = userSelect.getValue();
+            if (canonUser == null || canonUser.isBlank()) {
+                notify("Select a user first.", true);
+                return;
+            }
+            StorageBackend storage = storageRegistry.find(agent.storageBackendId()).orElse(null);
+            if (storage == null) {
+                notify("Storage backend '" + agent.storageBackendId() + "' not available.", true);
+                return;
+            }
+            String memPath = "coach-bot/memory/" + agent.id() + "/" + safeFilename(canonUser) + ".md";
+            try {
+                storage.read(memPath).ifPresentOrElse(
+                        doc -> {
+                            var topics = MemoryProgressParser.parse(doc);
+                            if (topics.isEmpty()) {
+                                grid.setItems(List.of());
+                                statusLabel.setText("No topics tracked yet for " + canonUser + ".");
+                                statusLabel.setVisible(true);
+                            } else {
+                                grid.setItems(topics);
+                                statusLabel.setVisible(false);
+                            }
+                        },
+                        () -> {
+                            grid.setItems(List.of());
+                            statusLabel.setText("No memory file found for " + canonUser + ".");
+                            statusLabel.setVisible(true);
+                        });
+            } catch (Exception ex) {
+                notify("Could not read memory: " + ex.getMessage(), true);
+            }
+        });
+
+        var layout = new VerticalLayout(filterRow, statusLabel, grid);
+        layout.setPadding(false);
+        return layout;
+    }
+
+    /** Mirrors the convention in {@code MemoryService} — keeps paths consistent. */
+    private static String safeFilename(String canonUserId) {
+        return canonUserId.replaceAll("[^a-zA-Z0-9_-]", "_");
+    }
+
+    // ── Cron builder ──────────────────────────────────────────────────────────
+
+    /**
+     * Returns a "Quick build" section wired to {@code cronField}.
+     *
+     * <p>When the time picker or day checkboxes change the cron field is updated live.
+     * If {@code cronField} already contains a simple {@code "min hour * * days"}
+     * expression the builder pre-populates from it; otherwise it defaults to
+     * weekdays at 09:00 and writes that into the cron field.
+     */
+    private Component buildCronBuilderSection(TextField cronField) {
+        var timePicker = new TimePicker();
+        timePicker.setLabel("Time");
+        timePicker.setWidth("130px");
+
+        var daysGroup = new CheckboxGroup<String>();
+        daysGroup.setLabel("Days");
+        daysGroup.setItems("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN");
+
+        // ── Shortcut buttons ──────────────────────────────────────────────────
+        var weekdaysBtn = new Button("Weekdays", e ->
+                daysGroup.setValue(Set.of("MON", "TUE", "WED", "THU", "FRI")));
+        weekdaysBtn.addThemeVariants(ButtonVariant.LUMO_SMALL, ButtonVariant.LUMO_TERTIARY);
+
+        var dailyBtn = new Button("Daily", e ->
+                daysGroup.setValue(Set.of("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")));
+        dailyBtn.addThemeVariants(ButtonVariant.LUMO_SMALL, ButtonVariant.LUMO_TERTIARY);
+
+        var weekendBtn = new Button("Weekend", e ->
+                daysGroup.setValue(Set.of("SAT", "SUN")));
+        weekendBtn.addThemeVariants(ButtonVariant.LUMO_SMALL, ButtonVariant.LUMO_TERTIARY);
+
+        var shortcuts = new HorizontalLayout(weekdaysBtn, dailyBtn, weekendBtn);
+        shortcuts.setSpacing(false);
+        shortcuts.getStyle().set("gap", "4px");
+
+        // ── Live sync to cronField ────────────────────────────────────────────
+        Runnable sync = () -> {
+            if (timePicker.getValue() == null || daysGroup.getValue().isEmpty()) return;
+            cronField.setValue(buildCron(timePicker.getValue(), daysGroup.getValue()));
+        };
+        timePicker.addValueChangeListener(e -> sync.run());
+        daysGroup.addValueChangeListener(e -> sync.run());
+
+        // ── Pre-populate builder from existing cron or set defaults ───────────
+        boolean parsed = tryCronToBuilder(cronField.getValue(), timePicker, daysGroup);
+        if (!parsed) {
+            timePicker.setValue(LocalTime.of(9, 0));
+            daysGroup.setValue(Set.of("MON", "TUE", "WED", "THU", "FRI"));
+            if (cronField.getValue().isBlank()) sync.run(); // only write default when field is empty
+        }
+
+        var row = new HorizontalLayout(timePicker, daysGroup, shortcuts);
+        row.setAlignItems(FlexComponent.Alignment.END);
+        row.setWidthFull();
+
+        var label = new Span("⏰ Quick build");
+        label.getStyle().set("font-size", "var(--lumo-font-size-s)");
+        label.getStyle().set("color", "var(--lumo-secondary-text-color)");
+        label.getStyle().set("font-weight", "500");
+
+        var section = new VerticalLayout(label, row);
+        section.setPadding(false);
+        section.setSpacing(false);
+        section.getStyle().set("border-bottom", "1px solid var(--lumo-contrast-20pct)");
+        section.getStyle().set("padding-bottom", "var(--lumo-space-s)");
+        section.getStyle().set("margin-bottom", "var(--lumo-space-s)");
+        return section;
+    }
+
+    /**
+     * Builds a 5-field cron expression from a time and a set of day names.
+     * Example: {@code LocalTime.of(9, 0), {"MON","TUE","WED","THU","FRI"}} → {@code "0 9 * * MON-FRI"}
+     */
+    private static String buildCron(LocalTime time, Set<String> days) {
+        String daysPart;
+        Set<String> all7    = Set.of("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN");
+        Set<String> weekdays = Set.of("MON", "TUE", "WED", "THU", "FRI");
+        Set<String> weekend  = Set.of("SAT", "SUN");
+        if (days.containsAll(all7)) {
+            daysPart = "*";
+        } else if (days.equals(weekdays)) {
+            daysPart = "MON-FRI";
+        } else if (days.equals(weekend)) {
+            daysPart = "SAT-SUN";
+        } else {
+            daysPart = List.of("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
+                    .stream().filter(days::contains).collect(Collectors.joining(","));
+            if (daysPart.isBlank()) daysPart = "*";
+        }
+        return time.getMinute() + " " + time.getHour() + " * * " + daysPart;
+    }
+
+    /**
+     * Tries to parse a simple {@code "min hour * * days"} cron expression and
+     * populate the builder controls. Returns {@code true} if successful.
+     */
+    private static boolean tryCronToBuilder(String cron,
+                                             TimePicker timePicker,
+                                             CheckboxGroup<String> daysGroup) {
+        if (cron == null || cron.isBlank()) return false;
+        String[] parts = cron.trim().split("\\s+");
+        if (parts.length != 5) return false;
+        // Only handle simple "min hour * * days" — not complex expressions
+        if (!"*".equals(parts[2]) || !"*".equals(parts[3])) return false;
+        try {
+            int minute = Integer.parseInt(parts[0]);
+            int hour   = Integer.parseInt(parts[1]);
+            String daysPart = parts[4];
+            Set<String> days = new HashSet<>();
+            if ("*".equals(daysPart)) {
+                days = Set.of("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN");
+            } else if ("MON-FRI".equalsIgnoreCase(daysPart)) {
+                days = Set.of("MON", "TUE", "WED", "THU", "FRI");
+            } else if ("SAT-SUN".equalsIgnoreCase(daysPart)) {
+                days = Set.of("SAT", "SUN");
+            } else {
+                for (String d : daysPart.split(",")) days.add(d.trim().toUpperCase());
+            }
+            timePicker.setValue(LocalTime.of(hour, minute));
+            daysGroup.setValue(days);
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

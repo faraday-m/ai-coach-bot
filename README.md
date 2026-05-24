@@ -234,8 +234,16 @@ BOT_WEB_PASSWORD=a-strong-password
 | **Commands** | Add / edit / delete `/quiz`, `/hint` etc. — applied immediately |
 | **Transports** | Add / edit / remove (transport, chatId) bindings |
 | **Schedules** | Add / edit / delete cron schedules with optional auto-save path |
+| **Messages** | Browse conversation history with transport and trigger-type filters; paginated |
+| **Progress** | Visual per-topic progress bars for a selected user (reads memory document) |
 
-All changes take effect immediately — no restart required.
+The **Messages tab** loads lazily (25 rows at a time as you scroll) and supports filtering by:
+- **Transport** — `telegram`, `webchat`, `console`, …
+- **Trigger** — `user_message` (regular chat) or `user_command` (message starting with `/`)
+
+The **Progress tab** reads the user's memory document and renders each topic from `## Topic Statistics` as a colour-coded progress bar (🟥 Needs work → 🟨 Familiar → 🟩 Confident).
+
+All other changes take effect immediately — no restart required.
 
 ---
 
@@ -250,6 +258,7 @@ These commands are available in every agent regardless of configuration:
 | `/memory` | Show the current learning memory for this user |
 | `/memory add <text>` | Append a note directly (no LLM call) |
 | `/memory reset` | Delete the memory file for this user |
+| `/progress` | Show a visual progress bar for all tracked topics (⬇️ / ➡️ / ⬆️ levels) |
 | `/onboard` | Restart the onboarding questionnaire |
 
 Agent-specific commands (e.g. `/quiz`, `/hint`) are defined per-agent in the Admin UI → Commands tab and appear alongside system commands in the Telegram menu and web chat command picker.
@@ -264,7 +273,7 @@ At any point in a conversation you can ask the bot to distil what was covered in
 /wiki notes/virtual-threads
 ```
 
-The LLM reads the conversation **since your last `/wiki` call** and produces a structured note. The checkpoint advances after each save — the next `/wiki` captures only the new part of the conversation.
+The LLM reads the conversation **since your last `/wiki` call** and produces a structured note. The checkpoint is stored as a database row ID and **survives restarts** — the next `/wiki` captures only the new part of the conversation, even after a reboot.
 
 ### With an instruction
 
@@ -597,7 +606,7 @@ src/main/java/dev/coachbot/
 │                   SchemaMigration        — programmatic SQLite column migrations
 │                   AgentRepository        — SQLite CRUD for agents
 │                   CommandRepository      — SQLite CRUD for slash-commands
-│                   MessageRepository      — conversation history (SQLite)
+│                   MessageRepository      — conversation history (SQLite) + admin findMessages()
 │                   UserIdentityRepository — cross-transport identity mapping
 ├── credentials/    env / vault / onecli   — pluggable credential providers
 ├── llm/            LlmBackend / LlmRequest / LlmResponse / ConversationMessage

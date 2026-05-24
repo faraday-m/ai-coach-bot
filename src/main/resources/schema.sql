@@ -40,12 +40,14 @@ CREATE TABLE IF NOT EXISTS conversations (
 
 -- Conversation history (persisted across restarts)
 CREATE TABLE IF NOT EXISTS messages (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id   TEXT    NOT NULL,
-    user_id    TEXT    NOT NULL,   -- transport-specific sender id (e.g. "tg:123456")
-    role       TEXT    NOT NULL,   -- USER | ASSISTANT
-    content    TEXT    NOT NULL,
-    created_at TEXT    NOT NULL
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id     TEXT    NOT NULL,
+    user_id      TEXT    NOT NULL,   -- transport-specific sender id (e.g. "tg:123456")
+    role         TEXT    NOT NULL,   -- USER | ASSISTANT
+    content      TEXT    NOT NULL,
+    created_at   TEXT    NOT NULL,
+    transport_id TEXT,               -- e.g. "telegram", "webchat"; NULL for system/internal
+    trigger_type TEXT                -- "user_message" | "user_command"; NULL for legacy rows
 );
 -- Lookup index: latest messages for a given (agent, user) pair
 CREATE INDEX IF NOT EXISTS idx_messages_lookup

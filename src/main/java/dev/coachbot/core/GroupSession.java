@@ -218,6 +218,12 @@ public class GroupSession {
             return;
         }
 
+        // ── /progress — visual progress bar across tracked topics ────────────
+        if (text.equalsIgnoreCase("/progress")) {
+            handleProgress(msg, canonicalId);
+            return;
+        }
+
         // ── /wiki — save to storage ───────────────────────────────────────────
         if (text.startsWith("/wiki")) {
             handleWiki(msg, canonicalId, text.substring(5).trim());
@@ -323,6 +329,28 @@ public class GroupSession {
                 • `/memory reset` — clear memory""");
     }
 
+    // ── /progress ─────────────────────────────────────────────────────────────
+
+    /**
+     * Shows a text-based learning progress bar for all topics tracked in the
+     * user's memory document. Reads the memory via {@link dev.coachbot.memory.MemoryService}
+     * and delegates formatting to {@link dev.coachbot.memory.MemoryProgressParser}.
+     */
+    private void handleProgress(InboundMessage msg, String canonicalId) {
+        memoryService().load(agentConfig.id(), canonicalId).ifPresentOrElse(
+                memory -> {
+                    var topics = dev.coachbot.memory.MemoryProgressParser.parse(memory);
+                    if (topics.isEmpty()) {
+                        reply(msg, "ℹ️ No topics tracked yet. Chat and use `/wiki` to build your learning history.");
+                    } else {
+                        reply(msg, dev.coachbot.memory.MemoryProgressParser.formatAsText(topics));
+                    }
+                },
+                () -> reply(msg,
+                        "ℹ️ No memory yet. Use `/wiki` to save notes — your progress will appear here once topics are tracked.")
+        );
+    }
+
     // ── /wiki ──────────────────────────────────────────────────────────────────
 
     /**
@@ -355,17 +383,10 @@ public class GroupSession {
             return;
         }
 
-        List<ConversationMessage> history = userHistories.get(canonicalId);
-        if (history == null || history.isEmpty()) {
-            reply(msg, "⚠️ No conversation to summarise yet. Chat with me first, then use /wiki.");
-            return;
-        }
-
-        // ── Extract only messages since last /wiki ────────────────────────────
-        int checkpoint = wikiCheckpoints.getOrDefault(canonicalId, 0);
-        // Guard against history being trimmed between two /wiki calls
-        int from = Math.min(checkpoint, history.size());
-        List<ConversationMessage> newMessages = history.subList(from, history.size());
+        // ── Extract only messages since last /wiki (ID-based, survives restarts) ─
+        long checkpoint = wikiCheckpoints.getOrDefault(canonicalId, 0L);
+        List<ConversationMessage> newMessages =
+                historyStore.loadAfter(agentConfig.id(), canonicalId, checkpoint);
 
         if (newMessages.isEmpty()) {
             reply(msg, "ℹ️ Nothing new since the last /wiki. Start a new topic and then call /wiki again.");
@@ -409,8 +430,9 @@ public class GroupSession {
                 }
             }
 
-            // Update checkpoint so next /wiki only processes new material
-            wikiCheckpoints.put(canonicalId, history.size());
+            // Update checkpoint so next /wiki only processes new material.
+            // Uses DB row ID — survives restarts unlike in-memory list indices.
+            wikiCheckpoints.put(canonicalId, historyStore.lastMessageId(agentConfig.id(), canonicalId));
 
             // Fire-and-forget memory update for each saved file
             for (WikiFile wf : files) {
@@ -564,12 +586,11 @@ public class GroupSession {
     private final Map<String, String> userSystemPromptOverrides = new ConcurrentHashMap<>();
 
     /**
-     * Tracks history size at the time of the last /wiki call per user.
-     * Used to extract only "new since last save" messages for the next /wiki.
-     * Stored as list size (not an index), so it's naturally bounded by MAX_HISTORY_TURNS.
-     * If the list is trimmed between two /wiki calls, we fall back to all available history.
+     * DB row ID of the last message exported via /wiki per user.
+     * Persists across restarts because it references a stable DB ID rather than
+     * an in-memory list index. Zero means "export from the beginning".
      */
-    private final Map<String, Integer> wikiCheckpoints = new ConcurrentHashMap<>();
+    private final Map<String, Long> wikiCheckpoints = new ConcurrentHashMap<>();
 
     /** Pattern that matches LLM-generated wiki file blocks: {@code <wiki_file path="...">...</wiki_file>}. */
     private static final Pattern WIKI_FILE_PATTERN =
@@ -612,9 +633,13 @@ public class GroupSession {
                 response = llmBackend.complete(request);
             }
 
-            // Persist both messages before updating in-memory (crash-safe order)
-            historyStore.append(agentConfig.id(), canonicalId, ConversationMessage.user(text));
-            historyStore.append(agentConfig.id(), canonicalId, ConversationMessage.assistant(response.text()));
+            // Persist both messages before updating in-memory (crash-safe order).
+            // Tag with transport and trigger so the admin Messages tab can filter by them.
+            String triggerType = text.startsWith("/") ? "user_command" : "user_message";
+            historyStore.append(agentConfig.id(), canonicalId,
+                    ConversationMessage.user(text), msg.transportId(), triggerType);
+            historyStore.append(agentConfig.id(), canonicalId,
+                    ConversationMessage.assistant(response.text()), msg.transportId(), triggerType);
 
             // Update in-memory history
             history.add(ConversationMessage.user(text));
