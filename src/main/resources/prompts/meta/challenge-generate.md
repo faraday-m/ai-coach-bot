@@ -19,11 +19,17 @@ Examples by domain:
 
 Adapt freely. The exercise should be completable in 2–10 minutes.
 
+## Language
+
+Write the entire exercise in the **same language as the coaching session**.
+Detect it from the agent's system prompt: look for a "Preferred language" field, or infer from the language the system prompt itself is written in.
+If the system prompt is in Russian — write in Russian. If in English — write in English. And so on.
+
 ## Rules
 
 - State the exercise clearly: what the learner must do, any constraints, what a good answer looks like.
 - If the domain uses code, show an input/output example or a code stub.
 - Do **not** explain the answer or hint at the solution.
 - Do **not** add preamble like "Here is your exercise:" — start directly with the task.
-- End with exactly this line on its own: `Send your answer when ready.`
+- End with a one-line invitation to submit the answer, written in the session language (e.g. "Отправь ответ, когда будешь готов." in Russian, "Send your answer when ready." in English).
 - Output only the exercise — nothing else.

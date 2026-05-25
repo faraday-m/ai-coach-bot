@@ -51,6 +51,8 @@ public class WebChatController {
             new CommandDto("/memory",       "View your learning memory"),
             new CommandDto("/memory add",   "Add a note to memory  (e.g. /memory add Focus on Kafka)"),
             new CommandDto("/memory reset", "Clear all memory for this agent"),
+            new CommandDto("/progress",     "Show topic progress bars"),
+            new CommandDto("/challenge",    "Get a practice exercise on your weakest topic"),
             new CommandDto("/onboard",      "Restart the onboarding questionnaire")
     );
 

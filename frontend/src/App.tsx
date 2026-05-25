@@ -1,41 +1,67 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { loadCommands, loadHistory, sendMessage, streamUrl } from './api'
+import { loadAgents, loadCommands, loadHistory, sendMessage, streamUrl } from './api'
 import { ChatMessage } from './components/ChatMessage'
 import { MessageInput } from './components/MessageInput'
 import { TypingIndicator } from './components/TypingIndicator'
 import { getSessionToken } from './session'
-import type { Command, Message } from './types'
+import type { Agent, Command, Message } from './types'
 
-// Agent ID is injected at build time via VITE_AGENT_ID env var (default: "default")
-const AGENT_ID = import.meta.env.VITE_AGENT_ID ?? 'default'
-const SESSION  = getSessionToken()
+/** Stable browser identity — routes SSE replies back to this tab. */
+const SESSION = getSessionToken()
+
+/** localStorage key for the last selected agent. */
+const AGENT_KEY = 'selectedAgentId'
 
 export default function App() {
+  const [agents,    setAgents]    = useState<Agent[]>([])
+  const [agentId,   setAgentId]   = useState<string>('')
   const [messages,  setMessages]  = useState<Message[]>([])
   const [commands,  setCommands]  = useState<Command[]>([])
   const [typing,    setTyping]    = useState(false)
   const [sending,   setSending]   = useState(false)
   const [connected, setConnected] = useState(false)
-  const bottomRef      = useRef<HTMLDivElement>(null)
-  const eventSrcRef    = useRef<EventSource | null>(null)
+  const bottomRef     = useRef<HTMLDivElement>(null)
+  const eventSrcRef   = useRef<EventSource | null>(null)
+  const reconnectRef  = useRef<ReturnType<typeof setTimeout> | null>(null)
   /** True once the first SSE open event fires — distinguishes "Connecting" from "Reconnecting". */
-  const everConnected  = useRef(false)
+  const everConnected = useRef(false)
 
-  // ── Load history + commands on mount ──────────────────────────────────────
+  // ── Load agents on mount ───────────────────────────────────────────────────
   useEffect(() => {
-    loadHistory(AGENT_ID, SESSION).then(setMessages)
-    loadCommands(AGENT_ID).then(setCommands)
+    loadAgents().then(loaded => {
+      setAgents(loaded)
+      if (loaded.length === 0) return
+      const stored  = localStorage.getItem(AGENT_KEY)
+      const valid   = loaded.find(a => a.id === stored)
+      setAgentId(valid ? valid.id : loaded[0].id)
+    })
   }, [])
+
+  // ── When agentId changes: clear messages, reload history + commands ────────
+  useEffect(() => {
+    if (!agentId) return
+    setMessages([])
+    setTyping(false)
+    setSending(false)
+    loadHistory(agentId, SESSION).then(setMessages)
+    loadCommands(agentId).then(setCommands)
+  }, [agentId])
 
   // ── Auto-scroll on new messages ───────────────────────────────────────────
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, typing])
 
-  // ── SSE connection ─────────────────────────────────────────────────────────
+  // ── SSE connection — reconnects whenever agentId changes ──────────────────
   useEffect(() => {
+    if (!agentId) return
+
+    // Reset connection state for the new agent
+    everConnected.current = false
+    setConnected(false)
+
     function connect() {
-      const es = new EventSource(streamUrl(AGENT_ID, SESSION))
+      const es = new EventSource(streamUrl(agentId, SESSION))
       eventSrcRef.current = es
 
       es.addEventListener('open', () => {
@@ -46,7 +72,7 @@ export default function App() {
       es.addEventListener('message', (e: MessageEvent<string>) => {
         setTyping(false)
         setSending(false)
-        setMessages((prev) => [
+        setMessages(prev => [
           ...prev,
           { id: crypto.randomUUID(), role: 'assistant', content: e.data, timestamp: Date.now() },
         ])
@@ -60,34 +86,43 @@ export default function App() {
         setConnected(false)
         es.close()
         // Auto-reconnect after 3 seconds
-        setTimeout(connect, 3_000)
+        reconnectRef.current = setTimeout(connect, 3_000)
       })
     }
 
     connect()
+
     return () => {
+      if (reconnectRef.current) clearTimeout(reconnectRef.current)
       eventSrcRef.current?.close()
     }
+  }, [agentId])
+
+  // ── Agent selection ────────────────────────────────────────────────────────
+  const handleAgentChange = useCallback((newId: string) => {
+    localStorage.setItem(AGENT_KEY, newId)
+    setAgentId(newId)
   }, [])
 
-  // ── Send message ──────────────────────────────────────────────────────────
+  // ── Send message ───────────────────────────────────────────────────────────
   const handleSend = useCallback(async (text: string) => {
+    if (!agentId) return
     const userMsg: Message = {
       id: crypto.randomUUID(),
       role: 'user',
       content: text,
       timestamp: Date.now(),
     }
-    setMessages((prev) => [...prev, userMsg])
+    setMessages(prev => [...prev, userMsg])
     setSending(true)
     setTyping(false)
 
     try {
-      await sendMessage(AGENT_ID, text, SESSION)
+      await sendMessage(agentId, text, SESSION)
     } catch (err) {
       console.error('Send failed:', err)
       setSending(false)
-      setMessages((prev) => [
+      setMessages(prev => [
         ...prev,
         {
           id: crypto.randomUUID(),
@@ -97,9 +132,14 @@ export default function App() {
         },
       ])
     }
-  }, [])
+  }, [agentId])
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  // ── Derived ────────────────────────────────────────────────────────────────
+  const currentAgent  = agents.find(a => a.id === agentId)
+  const multiAgent    = agents.length > 1
+  const isLoading     = agents.length === 0
+
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div className="flex flex-col h-dvh max-w-2xl mx-auto">
       {/* Header */}
@@ -108,9 +148,32 @@ export default function App() {
           AI
         </div>
         <div className="flex-1 min-w-0">
-          <h1 className="font-semibold text-gray-900 truncate">Coach Bot</h1>
+          {/* Agent selector — shown only when multiple agents are available */}
+          {multiAgent ? (
+            <select
+              value={agentId}
+              onChange={e => handleAgentChange(e.target.value)}
+              className="font-semibold text-gray-900 bg-transparent border-none outline-none cursor-pointer hover:text-blue-600 transition-colors w-full truncate pr-4"
+              aria-label="Select agent"
+            >
+              {agents.map(a => (
+                <option key={a.id} value={a.id}>{a.name}</option>
+              ))}
+            </select>
+          ) : (
+            <h1 className="font-semibold text-gray-900 truncate">
+              {isLoading ? 'Loading…' : (currentAgent?.name ?? 'Coach Bot')}
+            </h1>
+          )}
+
+          {/* Connection status */}
           <p className="text-xs text-gray-500">
-            {connected ? (
+            {!agentId ? (
+              <span className="flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-gray-300 inline-block" />
+                Loading agents…
+              </span>
+            ) : connected ? (
               <span className="flex items-center gap-1">
                 <span className="w-1.5 h-1.5 rounded-full bg-green-500 inline-block" />
                 Connected
@@ -132,7 +195,7 @@ export default function App() {
 
       {/* Message list */}
       <main className="flex-1 overflow-y-auto chat-scroll py-2 bg-gray-50">
-        {messages.length === 0 && !typing && (
+        {messages.length === 0 && !typing && agentId && (
           <div className="flex flex-col items-center justify-center h-full text-center px-8 text-gray-400">
             <div className="text-4xl mb-3">💬</div>
             <p className="text-sm">Start the conversation — ask anything!</p>
@@ -144,7 +207,7 @@ export default function App() {
           </div>
         )}
 
-        {messages.map((msg) => (
+        {messages.map(msg => (
           <ChatMessage key={msg.id} message={msg} />
         ))}
 
@@ -155,7 +218,7 @@ export default function App() {
       {/* Input */}
       <MessageInput
         commands={commands}
-        disabled={sending}
+        disabled={sending || !agentId}
         onSend={handleSend}
       />
     </div>

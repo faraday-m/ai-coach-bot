@@ -9,3 +9,8 @@ export interface Command {
   trigger: string
   description: string
 }
+
+export interface Agent {
+  id: string
+  name: string
+}

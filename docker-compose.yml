@@ -31,14 +31,11 @@ services:
     stdin_open: false   # set to true to enable console transport inside Docker
 
   # ── React chat frontend ─────────────────────────────────────────────────────
-  # Enable with: BOT_WEBCHAT_ENABLED=true  (also required in coach-bot env)
+  # Enable with: BOT_TRANSPORTS_WEBCHAT_ENABLED=true in .env (activates WebChatController)
   # Then open: http://localhost:3000
   chat-frontend:
     build:
       context: ./frontend
-      args:
-        # Which agent the frontend talks to (must match an agent ID in the DB)
-        VITE_AGENT_ID: "${VITE_AGENT_ID:-default}"
     profiles: [webchat]          # opt-in: docker compose --profile webchat up
     ports:
       - "${BOT_CHAT_PORT:-3000}:80"

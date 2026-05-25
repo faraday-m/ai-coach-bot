@@ -1,6 +1,13 @@
-import type { Command, Message } from './types'
+import type { Agent, Command, Message } from './types'
 
 const BASE = (agentId: string) => `/api/chat/${agentId}`
+
+/** Fetch the list of enabled agents available in the web chat. */
+export async function loadAgents(): Promise<Agent[]> {
+  const resp = await fetch('/api/agents')
+  if (!resp.ok) return []
+  return resp.json()
+}
 
 /** Send a message. Returns immediately (202 Accepted); reply arrives via SSE. */
 export async function sendMessage(agentId: string, text: string, sessionToken: string): Promise<void> {
