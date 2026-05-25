@@ -58,11 +58,13 @@ public class GroupSession {
     private static final Logger log = LoggerFactory.getLogger(GroupSession.class);
     private static final int MAX_HISTORY_TURNS  = 20; // = 40 messages (user + assistant)
     private static final int MAX_AGENT_STEPS    = 10; // safety cap for the agentic tool loop
-    private static final String META_PROMPT_PATH      = "prompts/meta/generate-coach-prompt.md";
-    private static final String WIKI_PROMPT_PATH      = "prompts/meta/wiki-summary.md";
-    private static final String MEMORY_PROMPT_PATH    = "prompts/meta/memory-update.md";
-    private static final String MEMORY_BOOTSTRAP_PATH = "prompts/meta/memory-bootstrap.md";
-    private static final String COMMANDS_PROMPT_PATH  = "prompts/meta/generate-commands.md";
+    private static final String META_PROMPT_PATH          = "prompts/meta/generate-coach-prompt.md";
+    private static final String WIKI_PROMPT_PATH          = "prompts/meta/wiki-summary.md";
+    private static final String MEMORY_PROMPT_PATH        = "prompts/meta/memory-update.md";
+    private static final String MEMORY_BOOTSTRAP_PATH     = "prompts/meta/memory-bootstrap.md";
+    private static final String COMMANDS_PROMPT_PATH      = "prompts/meta/generate-commands.md";
+    private static final String CHALLENGE_GENERATE_PATH   = "prompts/meta/challenge-generate.md";
+    private static final String CHALLENGE_EVALUATE_PATH   = "prompts/meta/challenge-evaluate.md";
 
     private volatile AgentConfig agentConfig;
     private final LlmBackend llmBackend;
@@ -83,6 +85,10 @@ public class GroupSession {
     private volatile String memoryBootstrapTemplate;
     /** Lazily loaded meta-prompt template for post-onboarding command generation. */
     private volatile String commandsPromptTemplate;
+    /** Lazily loaded meta-prompt template for challenge generation. */
+    private volatile String challengeGenerateTemplate;
+    /** Lazily loaded meta-prompt template for challenge evaluation. */
+    private volatile String challengeEvaluateTemplate;
 
     /** Manages the persistent per-user learning-memory document. Initialised lazily. */
     private volatile MemoryService memoryService;
@@ -94,6 +100,11 @@ public class GroupSession {
     private final Map<String, List<ConversationMessage>> userHistories = new ConcurrentHashMap<>();
     /** Active onboarding flows keyed by canonical user ID. */
     private final Map<String, OnboardingFlow> onboardingFlows = new ConcurrentHashMap<>();
+    /** Practice exercises awaiting the user's answer, keyed by canonical user ID. */
+    private final Map<String, PendingChallenge> pendingChallenges = new ConcurrentHashMap<>();
+
+    /** Holds the challenge text while waiting for the user to submit their answer. */
+    private record PendingChallenge(String challenge) {}
     private final AtomicBoolean running = new AtomicBoolean(false);
     private Thread workerThread;
 
@@ -188,8 +199,10 @@ public class GroupSession {
 
         // ── /cancel — abort any active flow ───────────────────────────────────
         if (text.equalsIgnoreCase("/cancel")) {
-            if (onboardingFlows.remove(canonicalId) != null) {
-                reply(msg, "Onboarding cancelled. Type /onboard to start again.");
+            boolean onboardingCancelled = onboardingFlows.remove(canonicalId)    != null;
+            boolean challengeCancelled  = pendingChallenges.remove(canonicalId)  != null;
+            if (onboardingCancelled || challengeCancelled) {
+                reply(msg, "Cancelled. Type /challenge for a new exercise or just ask me anything.");
             } else {
                 reply(msg, "Nothing to cancel.");
             }
@@ -199,6 +212,12 @@ public class GroupSession {
         // ── Active onboarding flow — feed input to FSM ────────────────────────
         if (onboardingFlows.containsKey(canonicalId)) {
             handleOnboardingAnswer(msg, canonicalId, text);
+            return;
+        }
+
+        // ── Active challenge — treat message as the submitted answer ──────────
+        if (pendingChallenges.containsKey(canonicalId)) {
+            handleChallengeAnswer(msg, canonicalId, text);
             return;
         }
 
@@ -229,6 +248,12 @@ public class GroupSession {
         // ── /progress — visual progress bar across tracked topics ────────────
         if (text.equalsIgnoreCase("/progress")) {
             handleProgress(msg, canonicalId);
+            return;
+        }
+
+        // ── /challenge — generate a domain-appropriate practice exercise ──────
+        if (text.equalsIgnoreCase("/challenge")) {
+            handleChallenge(msg, canonicalId);
             return;
         }
 
@@ -605,6 +630,74 @@ public class GroupSession {
             Pattern.compile("<wiki_file\\s+path=\"([^\"]+)\">(.*?)</wiki_file>", Pattern.DOTALL);
 
 
+    // ── /challenge ─────────────────────────────────────────────────────────────
+
+    /**
+     * Generates a domain-appropriate practice exercise targeting the learner's weakest topic.
+     *
+     * <p>The LLM receives the agent's system prompt (coaching domain) and the user's memory
+     * document so it can infer the correct exercise format and pick the weakest topic.
+     * The generated exercise is stored in {@link #pendingChallenges}; the next message from
+     * this user will be treated as their answer and routed to {@link #handleChallengeAnswer}.
+     */
+    private void handleChallenge(InboundMessage msg, String canonicalId) {
+        transportRegistry.find(msg.transportId()).ifPresent(t -> t.sendTyping(msg.chatId()));
+        String memory = memoryService().load(agentConfig.id(), canonicalId).orElse("");
+        String userMessage = "Agent context:\n" + agentConfig.systemPrompt()
+                + "\n\nUser memory:\n" + memory;
+        LlmRequest request = LlmRequest.of(
+                loadChallengeGenerateTemplate(), List.of(), userMessage, canonicalId, agentConfig.id());
+        try {
+            LlmResponse response = llmBackend.complete(request);
+            String challenge = response.text();
+            if (challenge == null || challenge.isBlank()) {
+                reply(msg, "⚠ Could not generate a challenge — please try again.");
+                return;
+            }
+            pendingChallenges.put(canonicalId, new PendingChallenge(challenge));
+            reply(msg, challenge);
+            log.info("[{}] Challenge generated for {} ({} chars)", agentConfig.id(), canonicalId, challenge.length());
+        } catch (Exception e) {
+            log.error("[{}] Error generating challenge for {}", agentConfig.id(), canonicalId, e);
+            tryReplyWithError(msg, e);
+        }
+    }
+
+    /**
+     * Evaluates the user's answer to a pending challenge.
+     *
+     * <p>The LLM receives the original exercise and the user's answer and returns structured
+     * feedback. The {@code MEMORY:} line at the end of the feedback is stripped before sending
+     * to the user and passed to {@link MemoryService#updateAsync} to update the learning memory.
+     */
+    private void handleChallengeAnswer(InboundMessage msg, String canonicalId, String answer) {
+        PendingChallenge pending = pendingChallenges.remove(canonicalId);
+        if (pending == null) {
+            // Race condition safety: fall through to normal LLM handling
+            handleLlmMessage(msg, canonicalId, answer);
+            return;
+        }
+        transportRegistry.find(msg.transportId()).ifPresent(t -> t.sendTyping(msg.chatId()));
+        String userMessage = "Exercise:\n" + pending.challenge() + "\n\n---\n\nAnswer:\n" + answer;
+        LlmRequest request = LlmRequest.of(
+                loadChallengeEvaluateTemplate(), List.of(), userMessage, canonicalId, agentConfig.id());
+        try {
+            LlmResponse response = llmBackend.complete(request);
+            String feedback = response.text();
+            if (feedback == null || feedback.isBlank()) {
+                reply(msg, "⚠ Could not evaluate the answer — please try again or type /challenge for a new exercise.");
+                return;
+            }
+            reply(msg, stripMemoryLine(feedback));
+            extractMemoryNote(feedback).ifPresent(note ->
+                    memoryService().updateAsync(agentConfig.id(), canonicalId, note));
+            log.info("[{}] Challenge evaluated for {}", agentConfig.id(), canonicalId);
+        } catch (Exception e) {
+            log.error("[{}] Error evaluating challenge answer for {}", agentConfig.id(), canonicalId, e);
+            tryReplyWithError(msg, e);
+        }
+    }
+
     // ── Normal LLM conversation ────────────────────────────────────────────────
 
     private void handleLlmMessage(InboundMessage msg, String canonicalId, String text) {
@@ -847,6 +940,72 @@ public class GroupSession {
             }
         }
         return memoryService;
+    }
+
+    // ── Challenge prompt loaders ───────────────────────────────────────────────
+
+    private String loadChallengeGenerateTemplate() {
+        if (challengeGenerateTemplate != null) return challengeGenerateTemplate;
+        try {
+            var resource = new ClassPathResource(CHALLENGE_GENERATE_PATH);
+            challengeGenerateTemplate = resource.getContentAsString(StandardCharsets.UTF_8);
+            return challengeGenerateTemplate;
+        } catch (IOException e) {
+            throw new IllegalStateException("Cannot load challenge-generate prompt from classpath: " + CHALLENGE_GENERATE_PATH, e);
+        }
+    }
+
+    private String loadChallengeEvaluateTemplate() {
+        if (challengeEvaluateTemplate != null) return challengeEvaluateTemplate;
+        try {
+            var resource = new ClassPathResource(CHALLENGE_EVALUATE_PATH);
+            challengeEvaluateTemplate = resource.getContentAsString(StandardCharsets.UTF_8);
+            return challengeEvaluateTemplate;
+        } catch (IOException e) {
+            throw new IllegalStateException("Cannot load challenge-evaluate prompt from classpath: " + CHALLENGE_EVALUATE_PATH, e);
+        }
+    }
+
+    // ── Challenge helpers ──────────────────────────────────────────────────────
+
+    /**
+     * Finds the last line starting with {@code MEMORY:} and returns the text after the prefix.
+     * Returns {@link java.util.Optional#empty()} if no such line exists.
+     */
+    static java.util.Optional<String> extractMemoryNote(String feedback) {
+        if (feedback == null) return java.util.Optional.empty();
+        String[] lines = feedback.split("\n");
+        for (int i = lines.length - 1; i >= 0; i--) {
+            String line = lines[i].trim();
+            if (line.startsWith("MEMORY:")) {
+                String note = line.substring("MEMORY:".length()).trim();
+                return note.isBlank() ? java.util.Optional.empty() : java.util.Optional.of(note);
+            }
+        }
+        return java.util.Optional.empty();
+    }
+
+    /**
+     * Returns the feedback string with the {@code MEMORY:} line (and any adjacent blank lines)
+     * removed, so the user never sees the internal memory note.
+     */
+    static String stripMemoryLine(String feedback) {
+        if (feedback == null) return "";
+        // Remove trailing blank lines + the MEMORY: line at the end
+        String[] lines = feedback.split("\n");
+        int lastContent = lines.length - 1;
+        // Find the MEMORY: line scanning from the end
+        while (lastContent >= 0 && (lines[lastContent].trim().isEmpty()
+                || lines[lastContent].trim().startsWith("MEMORY:"))) {
+            lastContent--;
+        }
+        if (lastContent < 0) return "";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i <= lastContent; i++) {
+            sb.append(lines[i]);
+            if (i < lastContent) sb.append('\n');
+        }
+        return sb.toString();
     }
 
     /**

@@ -259,6 +259,7 @@ These commands are available in every agent regardless of configuration:
 | `/memory add <text>` | Append a note directly (no LLM call) |
 | `/memory reset` | Delete the memory file for this user |
 | `/progress` | Show a visual progress bar for all tracked topics (⬇️ / ➡️ / ⬆️ levels) |
+| `/challenge` | Generate a practice exercise based on the weakest memory topic. Exercise format adapts to the agent's domain (code task, translation, quiz, etc.). Send your answer — the bot evaluates it and updates your memory. `/cancel` aborts an active challenge. |
 | `/onboard` | Restart the onboarding questionnaire |
 
 Agent-specific commands (e.g. `/quiz`, `/hint`) are defined per-agent in the Admin UI → Commands tab and appear alongside system commands in the Telegram menu and web chat command picker.

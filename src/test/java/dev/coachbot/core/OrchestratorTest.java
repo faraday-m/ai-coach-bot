@@ -276,4 +276,128 @@ class OrchestratorIntegrationTest {
         assertThat(llm.lastRequest.userId()).isEqualTo("user2");
         assertThat(llm.lastRequest.history()).isEmpty();
     }
+
+    // ── /challenge tests ───────────────────────────────────────────────────────
+
+    @Test
+    void challenge_generates_exercise_from_agent_context() throws InterruptedException {
+        transport.handler.onMessage(new InboundMessage(
+                "test", "chat1", "user1", "Alice", "/challenge", Instant.now()));
+
+        String reply = transport.sent.poll(3, TimeUnit.SECONDS);
+        assertThat(reply).isNotNull().isNotBlank();
+
+        // LLM must have received the agent system prompt in the user message
+        assertThat(llm.lastRequest.userMessage())
+                .contains("Agent context:")
+                .contains("You are a helpful coach.");
+    }
+
+    /** Storage backend that captures writes — used to verify async memory updates. */
+    static class WritableStorage implements StorageBackend {
+        final ConcurrentHashMap<String, String> store = new ConcurrentHashMap<>();
+
+        @Override public String id() { return "writable"; }
+        @Override public void write(String p, String c) { store.put(p, c); }
+        @Override public void append(String p, String c) { store.merge(p, c, (a, b) -> a + b); }
+        @Override public Optional<String> read(String p) { return Optional.ofNullable(store.get(p)); }
+        @Override public List<String> list(String p) { return List.of(); }
+        @Override public void delete(String p) { store.remove(p); }
+    }
+
+    /**
+     * LLM fake for challenge flow tests:
+     * - Calls containing "Exercise:" → evaluation response with MEMORY: note
+     * - Calls containing "Current memory:" → dummy memory document (from updateAsync)
+     * - Bootstrap calls (userId = "bootstrap") → minimal memory stub
+     * - Everything else → challenge text
+     */
+    static class ChallengeLlm implements LlmBackend {
+        volatile LlmRequest lastReq;
+
+        @Override public String id() { return "challenge-llm"; }
+
+        @Override
+        public LlmResponse complete(LlmRequest req) {
+            if ("bootstrap".equals(req.userId())) {
+                return LlmResponse.text("## Learning Plan\n- [ ] Topic A\n");
+            }
+            lastReq = req;
+            if (req.userMessage().contains("Exercise:")) {
+                return LlmResponse.text(
+                        "✅ Correct\n\nGood explanation.\n\nMEMORY: User demonstrated topic A.");
+            }
+            if (req.userMessage().contains("Current memory:")) {
+                return LlmResponse.text("## Learning Plan\n- [x] Topic A\n");
+            }
+            // Challenge generation: return a recognisable challenge string
+            return LlmResponse.text("Explain the concept.\n\nSend your answer when ready.");
+        }
+    }
+
+    @Test
+    void challenge_answer_triggers_evaluation_and_memory_update() throws InterruptedException {
+        var challengeLlm = new ChallengeLlm();
+        var storage      = new WritableStorage();
+
+        AgentConfig agent2 = new AgentConfig(
+                "test-agent", "Test Coach", "You are a helpful coach.",
+                "challenge-llm", "writable", "@Bot", false, true);
+        var transport2 = new CaptureTransport();
+        var session2 = new GroupSession(agent2, challengeLlm, storage,
+                new TransportRegistry(List.of(transport2)),
+                new InMemoryHistoryStore(), PASSTHROUGH_IDENTITY,
+                new dev.coachbot.translation.TranslationService(
+                        (t, f, to) -> Optional.empty(), "en"),
+                new NoopAgentRepository(), new NoopCommandRepository());
+        session2.start();
+        transport2.start(msg -> session2.enqueue(msg));
+
+        // Step 1: request challenge
+        transport2.handler.onMessage(new InboundMessage(
+                "test", "chat1", "user1", "Alice", "/challenge", Instant.now()));
+        transport2.sent.poll(3, TimeUnit.SECONDS);  // challenge text
+
+        // Step 2: submit answer
+        transport2.handler.onMessage(new InboundMessage(
+                "test", "chat1", "user1", "Alice", "Here is my answer.", Instant.now()));
+        String feedback = transport2.sent.poll(3, TimeUnit.SECONDS);
+
+        // Feedback is shown to user without MEMORY: line
+        assertThat(feedback).contains("✅ Correct").doesNotContain("MEMORY:");
+
+        // Evaluate LLM request must contain the original exercise and the answer
+        LlmRequest evalReq = challengeLlm.lastReq;
+        assertThat(evalReq.userMessage())
+                .contains("Exercise:")
+                .contains("Answer:")
+                .contains("Here is my answer.");
+
+        // Async memory update must write to storage
+        Thread.sleep(500);
+        assertThat(storage.store).containsKey("coach-bot/memory/test-agent/user1.md");
+
+        session2.stop();
+    }
+
+    @Test
+    void challenge_cancel_reverts_to_normal_llm() throws InterruptedException {
+        // Start a challenge
+        transport.handler.onMessage(new InboundMessage(
+                "test", "chat1", "user1", "Alice", "/challenge", Instant.now()));
+        transport.sent.poll(3, TimeUnit.SECONDS);
+
+        // Cancel it
+        transport.handler.onMessage(new InboundMessage(
+                "test", "chat1", "user1", "Alice", "/cancel", Instant.now()));
+        String cancelReply = transport.sent.poll(3, TimeUnit.SECONDS);
+        assertThat(cancelReply).contains("Cancelled");
+
+        // Next normal message must go to the LLM as regular conversation (not evaluated as a solution)
+        transport.handler.onMessage(new InboundMessage(
+                "test", "chat1", "user1", "Alice", "just chatting", Instant.now()));
+        transport.sent.poll(3, TimeUnit.SECONDS);
+
+        assertThat(llm.lastRequest.userMessage()).isEqualTo("just chatting");
+    }
 }
